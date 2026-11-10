@@ -7,6 +7,8 @@ import re
 import time
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -16,6 +18,9 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_CONNECTION,
@@ -30,21 +35,28 @@ from .const import (
     CONNECTION_WEB,
     DEFAULT_WX_PORT,
     DOMAIN,
+    EVENT_DOOR,
     EVENT_EMERGENCY,
     EVENT_PANEL,
     MANUFACTURER,
 )
 from .protege import (
     AreaStatus,
+    CommandRejected,
+    DoorLockState,
+    DoorState,
+    DoorStatus,
     InputStatus,
     PanelEvent,
     PanelInfo,
     ProtegeClient,
+    ProtegeError,
     ProtegeEventClient,
     Record,
     RecordType,
     StatusUpdate,
 )
+from .protege import protocol as proto
 from .protege.client import NUMBERING_RECORD_ID
 from .protege.wx import NO_RECORD, WXClient, WXError, WXSite, apply_names, apply_zone_settings
 
@@ -57,6 +69,36 @@ ALARM_CAUSE_WINDOW = 90.0
 
 # Whole words, so a name like "Panic Room" only trips it as part of a real alarm line.
 _EMERGENCY = re.compile(r"\b(duress|panic|medical|hold[ -]?up)\b", re.IGNORECASE)
+
+# Who the controller says unlocked the door, when this integration did not.
+_LOCK_SOURCES = {
+    DoorLockState.UNLOCKED_USER: "user",
+    DoorLockState.UNLOCKED_SCHEDULE: "schedule",
+    DoorLockState.UNLOCKED_USER_TIMED: "user",
+    DoorLockState.UNLOCKED_LATCHED: "latched",
+    DoorLockState.UNLOCKED_REX: "rex",
+    DoorLockState.UNLOCKED_REN: "ren",
+    DoorLockState.UNLOCKED_KEYPAD: "keypad",
+    DoorLockState.UNLOCKED_AREA: "area",
+    DoorLockState.UNLOCKED_FIRE: "fire",
+}
+SOURCE_HOME_ASSISTANT = "home_assistant"
+RELOCK_RETRY = 15.0
+
+
+def door_unlock_store(hass: HomeAssistant, entry: ConfigEntry) -> Store[dict[str, Any]]:
+    """Pending unlock_for timers. Times only: no PINs or passwords."""
+    return Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.door_unlocks")
+
+
+@dataclass
+class DoorUnlockPlan:
+    """A timed unlock this integration started, kept until the controller reports locked."""
+
+    source: str
+    duration: int | None = None
+    until: float | None = None  # unix time; None once a manual lock has cancelled it
+    relock_requested: bool = False
 
 
 def emergency_kind(text: str | None) -> str | None:
@@ -178,6 +220,11 @@ class ProtegeHub:
         self._area_alarm: dict[int, bool] = {}
         # The input that set each area's alarm off, kept until the area is disarmed.
         self.alarm_cause: dict[int, str | None] = {}
+        self._door_plans: dict[int, DoorUnlockPlan] = {}
+        self._door_timers: dict[int, CALLBACK_TYPE] = {}
+        self._reported_doors: dict[int, DoorStatus] = {}
+        self._reported_unlocked: set[int] = set()
+        self._tick_unsub: CALLBACK_TYPE | None = None
 
     # ----- identity -------------------------------------------------------
 
@@ -330,12 +377,215 @@ class ProtegeHub:
                 self.alarm_cause[update.index] = None
         return []
 
+    # ----- timed unlock ---------------------------------------------------
+
+    def unlock_remaining(self, index: int) -> tuple[str, int] | None:
+        """ISO unlock_until and whole seconds left, once the controller reports unlocked."""
+        plan = self._door_plans.get(index)
+        if plan is None or plan.until is None or index not in self._reported_unlocked:
+            return None
+        return dt_util.utc_from_timestamp(plan.until).isoformat(), max(0, int(plan.until - time.time()))
+
+    async def async_schedule_relock(
+        self, index: int, seconds: int, source: str = SOURCE_HOME_ASSISTANT
+    ) -> None:
+        """Unlock stays latched until `seconds` have passed, then this integration locks it."""
+        self._door_plans[index] = DoorUnlockPlan(source=source, duration=seconds, until=time.time() + seconds)
+        self._arm_timer(index)
+        self._ensure_tick()
+        await self._save_door_plans()
+
+    async def async_cancel_relock(self, index: int) -> DoorUnlockPlan | None:
+        """A manual lock. The timer must not lock the door again afterwards.
+
+        Returns the suspended plan so the caller can put it back if the lock command fails.
+        """
+        plan = self._door_plans.get(index)
+        if plan is None or plan.until is None:
+            return None
+        suspended = DoorUnlockPlan(source=plan.source, duration=plan.duration, until=plan.until)
+        plan.until = None
+        plan.relock_requested = True
+        self._cancel_timer(index)
+        self._ensure_tick()
+        await self._save_door_plans()
+        return suspended
+
+    async def async_resume_relock(self, index: int, suspended: DoorUnlockPlan) -> None:
+        """Put back a timer suspended for a lock command that the panel refused."""
+        if suspended.until is None:
+            return
+        plan = self._door_plans.get(index)
+        if plan is None:
+            plan = DoorUnlockPlan(source=suspended.source)
+            self._door_plans[index] = plan
+        plan.source = suspended.source
+        plan.duration = suspended.duration
+        plan.until = suspended.until
+        plan.relock_requested = False
+        self._arm_timer(index)
+        self._ensure_tick()
+        await self._save_door_plans()
+
+    async def async_forget_relock(self, index: int) -> None:
+        """Drop a timer whose unlock command never succeeded."""
+        if self._door_plans.pop(index, None) is None:
+            return
+        self._cancel_timer(index)
+        self._ensure_tick()
+        await self._save_door_plans()
+
+    def _arm_timer(self, index: int, delay: float | None = None) -> None:
+        plan = self._door_plans.get(index)
+        if plan is None or plan.until is None:
+            return
+        if delay is None:
+            delay = max(0.0, plan.until - time.time())
+        self._cancel_timer(index)
+
+        @callback
+        def fire(_now: Any) -> None:
+            self._door_timers.pop(index, None)
+            self.hass.async_create_task(self._relock(index))
+
+        self._door_timers[index] = async_call_later(self.hass, delay, fire)
+
+    def _cancel_timer(self, index: int) -> None:
+        if (unsub := self._door_timers.pop(index, None)) is not None:
+            unsub()
+
+    def _cancel_door_timers(self) -> None:
+        for index in list(self._door_timers):
+            self._cancel_timer(index)
+        if self._tick_unsub is not None:
+            self._tick_unsub()
+            self._tick_unsub = None
+
+    def _ensure_tick(self) -> None:
+        """Refresh remaining time while a timed unlock is showing."""
+        active = any(plan.until is not None for plan in self._door_plans.values())
+        if active and self._tick_unsub is None:
+            self._tick_unsub = async_track_time_interval(self.hass, self._tick_doors, timedelta(seconds=1))
+        elif not active and self._tick_unsub is not None:
+            self._tick_unsub()
+            self._tick_unsub = None
+
+    @callback
+    def _tick_doors(self, _now: Any) -> None:
+        for index, plan in self._door_plans.items():
+            if plan.until is None:
+                continue
+            for listener in list(self._listeners.get((RecordType.DOOR, index), ())):
+                listener()
+        self._ensure_tick()
+
+    async def _relock(self, index: int) -> None:
+        plan = self._door_plans.get(index)
+        if plan is None or plan.until is None:
+            return
+        plan.relock_requested = True
+        try:
+            await self.client.door_lock(index)
+        except CommandRejected as err:
+            plan.relock_requested = False
+            if err.code == proto.NACK_SERVICE_INDEX_NOT_VALID:
+                await self.async_forget_relock(index)
+                return
+            _LOGGER.warning("Could not relock door %s: %s", index, err)
+            self._arm_timer(index, RELOCK_RETRY)
+        except ProtegeError as err:
+            plan.relock_requested = False
+            _LOGGER.warning("Could not relock door %s: %s", index, err)
+            self._arm_timer(index, RELOCK_RETRY)
+
+    async def _restore_unlocks(self) -> None:
+        data = await door_unlock_store(self.hass, self.entry).async_load() or {}
+        known = {r.index for r in self.records_of(RecordType.DOOR)}
+        for key, item in (data.get("doors") or {}).items():
+            try:
+                index = int(key)
+                until = float(item["until"])
+                duration = int(item["duration"])
+                source = str(item.get("source") or SOURCE_HOME_ASSISTANT)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if index not in known:
+                continue
+            self._door_plans[index] = DoorUnlockPlan(source=source, duration=duration, until=until)
+            self._arm_timer(index)
+        self._ensure_tick()
+
+    async def _save_door_plans(self) -> None:
+        doors = {
+            str(index): {"until": plan.until, "duration": plan.duration, "source": plan.source}
+            for index, plan in self._door_plans.items()
+            if plan.until is not None
+        }
+        await door_unlock_store(self.hass, self.entry).async_save({"doors": doors})
+
+    def _door_source(self, index: int, status: DoorStatus, *, relock: bool) -> str:
+        plan = self._door_plans.get(index)
+        if relock:
+            if plan is not None and plan.relock_requested:
+                return plan.source
+            return "controller"
+        if plan is not None and plan.until is not None:
+            return plan.source
+        if status.door_state == DoorState.FORCED_OPEN:
+            return "forced"
+        state = status.lock_state
+        if isinstance(state, DoorLockState):
+            return _LOCK_SOURCES.get(state, state.name.lower())
+        return "controller"
+
+    def _fire_door(self, index: int, action: str, status: DoorStatus) -> None:
+        record = next((r for r in self.records_of(RecordType.DOOR) if r.index == index), None)
+        plan = self._door_plans.get(index)
+        self.hass.bus.async_fire(
+            EVENT_DOOR,
+            {
+                "entry_id": self.entry.entry_id,
+                "action": action,
+                "door": record.default_name if record else f"Door {index}",
+                "source": self._door_source(index, status, relock=action == "relocked"),
+                "duration": None if plan is None else plan.duration,
+            },
+        )
+
+    def _on_reported_door(self, index: int, status: DoorStatus) -> None:
+        """Fire door events from the controller's status, not from an assumed command."""
+        previous = self._reported_doors.get(index)
+        self._reported_doors[index] = status
+        if status.locked:
+            self._reported_unlocked.discard(index)
+        else:
+            self._reported_unlocked.add(index)
+        if previous is None:
+            return
+        relocked = not previous.locked and status.locked
+        if previous.locked and not status.locked:
+            self._fire_door(index, "unlocked", status)
+        elif relocked:
+            self._fire_door(index, "relocked", status)
+        was_open = previous.door_state != DoorState.CLOSED
+        now_open = status.door_state != DoorState.CLOSED
+        if not was_open and now_open:
+            self._fire_door(index, "opened", status)
+        elif was_open and not now_open:
+            self._fire_door(index, "closed", status)
+        if relocked and index in self._door_plans:
+            self._door_plans.pop(index, None)
+            self._cancel_timer(index)
+            self._ensure_tick()
+            self.hass.async_create_task(self._save_door_plans())
+
     # ----- lifecycle ------------------------------------------------------
 
     async def async_start(self) -> None:
         self._unsubs.append(self.client.add_status_listener(self._on_status))
         self._unsubs.append(self.client.add_connection_listener(self._on_connection))
         await self.client.start(self.records)
+        await self._restore_unlocks()
 
         if self.web:
             # The web client reads the event log itself.
@@ -351,6 +601,7 @@ class ProtegeHub:
             await self.events.start()
 
     async def async_stop(self) -> None:
+        self._cancel_door_timers()
         for unsub in self._unsubs:
             unsub()
         self._unsubs.clear()
@@ -394,6 +645,12 @@ class ProtegeHub:
 
     @callback
     def _on_status(self, update: StatusUpdate) -> None:
+        if (
+            update.record_type is RecordType.DOOR
+            and isinstance(update.status, DoorStatus)
+            and update.reported
+        ):
+            self._on_reported_door(update.index, update.status)
         dependants = self._track(update)
         for key in [(update.record_type, update.index), *dependants]:
             for listener in list(self._listeners.get(key, ())):

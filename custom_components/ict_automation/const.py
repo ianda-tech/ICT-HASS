@@ -21,6 +21,7 @@ DEFAULT_PORT = 21000
 
 EVENT_PANEL = f"{DOMAIN}_event"
 EVENT_EMERGENCY = f"{DOMAIN}_emergency"
+EVENT_DOOR = f"{DOMAIN}_door"
 
 EVENT_TYPES = [
     "access_granted",

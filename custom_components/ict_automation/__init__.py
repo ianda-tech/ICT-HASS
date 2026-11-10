@@ -19,6 +19,7 @@ from .const import CONF_CONNECTION, CONF_NUMBERING, CONF_PIN, CONF_RECORDS, CONN
 from .hub import (
     ProtegeHub,
     async_discover_records,
+    door_unlock_store,
     link_child_devices,
     records_to_data,
     remove_stale_devices,
@@ -145,8 +146,9 @@ async def _async_update_listener(hass: HomeAssistant, entry: ProtegeConfigEntry)
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Deleting the integration also deletes its saved web session."""
+    """Deleting the integration also deletes its saved web session and unlock timers."""
     await session_store(hass, entry).async_remove()
+    await door_unlock_store(hass, entry).async_remove()
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ProtegeConfigEntry) -> bool:

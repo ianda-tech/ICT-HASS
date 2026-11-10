@@ -194,6 +194,8 @@ class StatusUpdate:
     record_type: RecordType
     index: int
     status: Status
+    # False for the optimistic state shown before a read-back. Door events ignore those.
+    reported: bool = True
 
 
 @dataclass
