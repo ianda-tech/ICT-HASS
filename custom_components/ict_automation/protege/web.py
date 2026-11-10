@@ -536,23 +536,25 @@ class ProtegeWebClient:
             if record_type in tables:
                 await self.refresh(record_type)
 
-    async def refresh(self, record_type: RecordType) -> None:
-        """Read one status table and pass on what changed."""
+    async def refresh(self, record_type: RecordType) -> set[int]:
+        """Read one status table and pass on what changed. Returns the record ids in the reply."""
         if not any(key[0] is record_type for key in self.records):
-            return
+            return set()
         async with self._lock:
             reply = await self._request(f"Request&Type=Status&SubType={TABLES[record_type]}")
         if reply.strip().upper() in _NOTHING:
-            return
+            return set()
         self._set_denied(record_type, _is_fail(reply))
         if _is_fail(reply):
-            return
+            return set()
         references = {index: r.reference for (rt, index), r in self.records.items() if rt is record_type}
         timed_door = False
+        seen: set[int] = set()
         for index, status in parse_status(record_type, reply, references).items():
             key = (record_type, index)
             if key not in self.records:
                 continue
+            seen.add(index)
             if isinstance(status, DoorStatus) and status.lock_state != DoorLockState.LOCKED:
                 timed_door = timed_door or status.lock_state in (
                     DoorLockState.UNLOCKED_USER,
@@ -566,6 +568,7 @@ class ProtegeWebClient:
         if timed_door:
             # Timed unlocks relock on their own without an event; look again shortly.
             self._refresh_later(record_type, (3.0, 8.0))
+        return seen
 
     def _apply(self, update: StatusUpdate) -> None:
         self.status[(update.record_type, update.index)] = update.status
@@ -619,8 +622,12 @@ class ProtegeWebClient:
             _LOGGER.debug("WX control %s refused: %r", params, reply[:80])
             raise CommandRejected(None)
         if assumed is not None:
-            self._apply(StatusUpdate(record_type, index, assumed))
-        await self.refresh(record_type)
+            self._apply(StatusUpdate(record_type, index, assumed, reported=False))
+        seen = await self.refresh(record_type)
+        # Refresh skips a row that still matches the assumption. If the reply contained
+        # that row, the assumption matches the controller: publish it as reported.
+        if assumed is not None and index in seen and self.status.get((record_type, index)) == assumed:
+            self._apply(StatusUpdate(record_type, index, assumed, reported=True))
         self._refresh_later(record_type, (1.0, 3.0, 6.0))
 
     def _assumed_door(self, index: int, lock_state: DoorLockState) -> DoorStatus:

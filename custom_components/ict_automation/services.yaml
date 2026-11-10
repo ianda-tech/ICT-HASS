@@ -21,6 +21,17 @@ turn_on_for:
       selector:
         duration:
 
+unlock_for:
+  target:
+    entity:
+      integration: ict_automation
+      domain: lock
+  fields:
+    duration:
+      required: true
+      selector:
+        duration:
+
 bypass:
   target:
     entity:

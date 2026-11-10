@@ -174,8 +174,23 @@ grouped under the module they are wired to. Names come from the panel; anything 
 **Duress, panic and medical** alarms raise a critical alert under **Settings > Repairs** until you mark it handled, and fire an
 `ict_automation_emergency` event for automations. With the control service this needs event logging set up.
 
-**Actions**: `ict_automation.force_arm` (alarm panel), `ict_automation.turn_on_for` (output, with a duration) and
-`ict_automation.bypass` (bypass switch, optionally permanent).
+**Actions**: `ict_automation.force_arm` (alarm panel), `ict_automation.turn_on_for` (output, with a duration),
+`ict_automation.unlock_for` (lock, with a duration) and `ict_automation.bypass` (bypass switch, optionally permanent).
+
+**Timed unlock** (`ict_automation.unlock_for`): unlocks a door for the duration you give, then locks it.
+The control service and the web interface both have a momentary unlock, but it uses the door's programmed lock
+activation time and has no duration field, so this action unlocks the door latched and sends lock when the time
+is up. Locking the door from Home Assistant cancels that timer; if the panel rejects the lock, the timer is put
+back. The schedule is stored and resumed after a restart (if Home Assistant was stopped past the end time, it
+locks as soon as it is talking to the panel again). While the controller reports the door unlocked, the lock
+entity has `unlock_until` (UTC) and `remaining` (whole seconds). Those attributes follow the controller's
+reported status, not the moment the command was sent.
+
+The same status changes fire `ict_automation_door` for automations, including unlocks Home Assistant did not
+start. `action` is `unlocked`, `opened`, `closed` or `relocked`. `door` is the door's name, `source` is who or
+what caused it (`home_assistant` for this action, otherwise `user`, `schedule`, `rex`, `keypad`, `latched`,
+`forced`, `controller`, …) and `duration` is the number of seconds when this action started the timer. This
+event comes from door status, so it does not need the separate events service.
 
 ### Seeing events
 
@@ -185,6 +200,8 @@ In web-only mode, or with event logging on the control service, every panel even
   Its types are `access_granted`, `access_denied`, `armed`, `disarmed`, `alarm`, `door`, `input`, `output`, `user`, `trouble` and `other`.
 * The **Activity** (logbook) page, as readable text such as *User Dave Entry Granted Front Door Using User By Card*.
 * The `ict_automation_event` bus event, with `text`, `category`, `user` and `code`, for automations.
+* Door lock and contact changes also fire `ict_automation_door` (`action`, `door`, `source`, `duration`),
+  from the door's reported status. That one does not need event logging.
 
 Card numbers are removed from event text so they don't end up in Home Assistant's history.
 
