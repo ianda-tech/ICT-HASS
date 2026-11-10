@@ -7,7 +7,7 @@ from collections.abc import Callable
 from homeassistant.components.logbook import LOGBOOK_ENTRY_MESSAGE, LOGBOOK_ENTRY_NAME
 from homeassistant.core import Event, HomeAssistant, callback
 
-from .const import DOMAIN, EVENT_PANEL
+from .const import DOMAIN, EVENT_DOOR, EVENT_PANEL
 
 
 @callback
@@ -21,3 +21,13 @@ def async_describe_events(
         return {LOGBOOK_ENTRY_NAME: "ICT Protege", LOGBOOK_ENTRY_MESSAGE: text}
 
     async_describe_event(DOMAIN, EVENT_PANEL, describe)
+
+    @callback
+    def describe_door(event: Event) -> dict[str, str]:
+        door = event.data.get("door") or "Door"
+        action = event.data.get("action") or "changed"
+        source = event.data.get("source")
+        text = f"{door} {action}" + (f" ({source})" if source else "")
+        return {LOGBOOK_ENTRY_NAME: "ICT Protege", LOGBOOK_ENTRY_MESSAGE: text}
+
+    async_describe_event(DOMAIN, EVENT_DOOR, describe_door)

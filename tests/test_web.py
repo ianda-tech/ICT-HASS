@@ -346,6 +346,34 @@ async def test_web_entities_and_codes(hass: HomeAssistant, controller) -> None:
     await hass.async_block_till_done()
 
 
+async def test_web_unlock_for_relocks(hass: HomeAssistant, controller) -> None:
+    from custom_components.ict_automation.const import EVENT_DOOR
+
+    entry = _entry(controller, {CONF_CODE_MODE: CODE_MODE_NONE})
+    await _setup(hass, entry)
+    events = []
+    hass.bus.async_listen(EVENT_DOOR, events.append)
+    await hass.services.async_call(
+        DOMAIN, "unlock_for", {"entity_id": "lock.front_door", "duration": 4}, blocking=True
+    )
+    assert ("GXT_DOORS_TBL", 0, 2, None) in controller.controls
+    assert hass.states.get("lock.front_door").attributes["remaining"] > 0
+    await _settle(hass, lambda: any(e.data["action"] == "unlocked" for e in events))
+    assert events[0].data["door"] == "Front Door"
+    assert events[0].data["source"] == "home_assistant"
+    assert events[0].data["duration"] == 4
+    assert ("GXT_DOORS_TBL", 0, 0, None) not in controller.controls
+
+    # The wall-clock wait is covered on the control-service client. Here, bring the
+    # saved deadline forward so the same timer sends lock without a multi-second poll.
+    entry.runtime_data._door_plans[0].until = 0
+    entry.runtime_data._arm_timer(0)
+    await hass.async_block_till_done()
+    await _settle(hass, lambda: ("GXT_DOORS_TBL", 0, 0, None) in controller.controls)
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
 async def test_web_without_codes(hass: HomeAssistant, controller) -> None:
     entry = _entry(controller, {CONF_CODE_MODE: CODE_MODE_NONE})
     await _setup(hass, entry)

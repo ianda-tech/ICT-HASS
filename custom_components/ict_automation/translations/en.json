@@ -295,6 +295,16 @@
         }
       }
     },
+    "unlock_for": {
+      "name": "Unlock for",
+      "description": "Unlock a door for a set time, then lock it again.",
+      "fields": {
+        "duration": {
+          "name": "Duration",
+          "description": "How long to leave the door unlocked (up to about 18 hours)."
+        }
+      }
+    },
     "bypass": {
       "name": "Bypass input",
       "description": "Bypass an input. Temporary bypass ends when the area next disarms.",

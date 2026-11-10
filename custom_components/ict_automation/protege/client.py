@@ -767,7 +767,7 @@ class ProtegeClient:
                     await self._logout()
         target = _command_target(raw)
         if error is None and assumed is not None and target is not None:
-            self._apply(StatusUpdate(target[0], target[1], assumed))
+            self._apply(StatusUpdate(target[0], target[1], assumed, reported=False))
         # Changes made while logged in are not pushed, and not every panel honours the
         # "force update" monitoring flag. Read the commanded record back straight away and
         # again over the next few seconds (doors and outputs change on timers), while
@@ -825,7 +825,11 @@ class ProtegeClient:
         )
 
     async def door_unlock(self, index: int) -> None:
-        """Momentary unlock (the door relocks after its programmed time)."""
+        """Momentary unlock. The panel relocks after the door's programmed time.
+
+        The command has no duration field (ACS door subcommand 0x01, and the web
+        interface's Unlock Door). A caller-chosen time has to latch and lock later.
+        """
         # Read back for longer so the automatic relock shows up.
         await self._run_command(
             p.build_record_command(p.GROUP_DOOR, p.DOOR_UNLOCK_MOMENTARY, index),
