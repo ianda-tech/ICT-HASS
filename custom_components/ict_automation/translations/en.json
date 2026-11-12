@@ -11,7 +11,7 @@
       },
       "user": {
         "title": "Connect to your ICT Protege",
-        "description": "Enter the controller's address and a WX web interface operator created just for Home Assistant. HTTPS must be enabled on the controller (firmware 4.00.1676 or later).\n\nHome Assistant then looks for the Automation and Control service. If it answers, it is used for control (pushed live, and arm codes are checked by the panel) and the operator only reads names, so it only needs to view programming. If it doesn't, everything goes through the web interface, so give the operator's role rights to view status and the event log and to control only the areas, doors and outputs you want.",
+        "description": "Enter the controller's address. A WX web interface operator is optional: Protege WX uses it for names and, without the Automation licence, for control. Protege GX has no WX web interface, so leave the operator blank and use the Automation and Control service. Names then fall back to Door 0, Area 1, Input CP001:02 and so on, and you can rename them in Home Assistant.\n\nIf the control service answers it is used for control. If it doesn't, everything goes through the WX web interface, which needs the operator.",
         "data": {
           "host": "Host",
           "username": "Operator name",
@@ -85,10 +85,29 @@
       "init": {
         "title": "Options",
         "menu_options": {
+          "records": "Record IDs and discovery",
           "names": "Names and zone settings (WX web interface)",
           "events": "Event logging",
           "codes": "Arming codes",
           "upgrade": "Switch to the Automation and Control service"
+        }
+      },
+      "records": {
+        "title": "Record IDs and discovery",
+        "description": "The scan starts at record ID 0 and keeps going through empty IDs. How many empty IDs in a row to walk past: 64 finds a door at 0, inputs after a short gap and outputs that start in the teens. 0 scans the whole range (doors and areas through 255, inputs and outputs through 511) and takes longer.\n\nIDs typed here are always kept, even when a scan does not see them. Use 0, 12-20 or 19=Garage light. Leave a box empty to stop pinning that type. Rename entities in Home Assistant; those names are kept.",
+        "data": {
+          "discovery_gap": "Empty IDs to skip past",
+          "doors": "Door IDs",
+          "areas": "Area IDs",
+          "inputs": "Input IDs",
+          "outputs": "Output IDs"
+        },
+        "data_description": {
+          "discovery_gap": "0 scans every ID up to the limit. The control service is asked one ID at a time.",
+          "doors": "Record IDs, not the order they appear on screen.",
+          "areas": "The house area is often 1, and a system area is often 0.",
+          "inputs": "Onboard points are CP001. Expander points often sit after a run of empty IDs.",
+          "outputs": "Outputs often start well above 1."
         }
       },
       "names": {
@@ -149,7 +168,9 @@
       "code_incomplete": "Enter both a name and a code.",
       "code_too_short": "Use at least 4 digits.",
       "code_name_taken": "That person already has a code. Remove it first to change it.",
-      "wrong_panel": "That control service belongs to a different panel."
+      "wrong_panel": "That control service belongs to a different panel.",
+      "invalid_ids": "Use record IDs like 0, 12-20 or 19=Garage light.",
+      "invalid_gap": "Use 0 to scan the full range, or a number up to 512."
     },
     "abort": {
       "upgraded": "Switched to the Automation and Control service."

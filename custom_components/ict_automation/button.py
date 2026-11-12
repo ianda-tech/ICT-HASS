@@ -6,11 +6,10 @@ from homeassistant.components.button import ButtonEntity
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import ProtegeConfigEntry
 from .const import CONF_NUMBERING, CONF_RECORDS, DOMAIN
-from .entity import ProtegeEntity
+from .entity import AddConfigEntryEntitiesCallback, ProtegeEntity
 from .hub import ProtegeHub, async_discover_records, records_to_data
 from .protege import ProtegeError, RecordType
 from .upgrade import async_check_control_service

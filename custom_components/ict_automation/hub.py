@@ -24,8 +24,11 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_CONNECTION,
+    CONF_DISCOVERY_GAP,
     CONF_EVENTS_PIN,
     CONF_EVENTS_PORT,
+    CONF_LEGACY_KEYS,
+    CONF_MANUAL_RECORDS,
     CONF_NUMBERING,
     CONF_PIN,
     CONF_RECORDS,
@@ -33,6 +36,7 @@ from .const import (
     CONF_WX_PORT,
     CONF_WX_USERNAME,
     CONNECTION_WEB,
+    DEFAULT_DISCOVERY_GAP,
     DEFAULT_WX_PORT,
     DOMAIN,
     EVENT_DOOR,
@@ -58,7 +62,7 @@ from .protege import (
 )
 from .protege import protocol as proto
 from .protege.client import NUMBERING_RECORD_ID
-from .protege.wx import NO_RECORD, WXClient, WXError, WXSite, apply_names, apply_zone_settings
+from .protege.wx import NO_RECORD, WXClient, WXSite, apply_names, apply_zone_settings
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -138,6 +142,145 @@ def records_from_data(data: list[dict[str, Any]]) -> list[Record]:
     ]
 
 
+def legacy_key(record: Record) -> str:
+    return f"{record.record_type.value}:{record.index}"
+
+
+# 1.x unique IDs and device identifiers, keyed by the entity suffix passed to ProtegeEntity.
+_LEGACY_UNIQUE = {
+    (RecordType.DOOR, "lock"): "ict_door_{index}",
+    (RecordType.DOOR, "contact"): "ict_door_contact_{index}",
+    (RecordType.AREA, "area"): "ict_area_{index}",
+    (RecordType.INPUT, "input"): "ict_input_{index}",
+    (RecordType.INPUT, "tamper"): "ict_trouble_{index}",
+    (RecordType.INPUT, "bypass"): "ict_input_bypass_{index}",
+    (RecordType.OUTPUT, "output"): "ict_output_{index}",
+}
+_LEGACY_DEVICE = {
+    RecordType.DOOR: "door_{index}",
+    RecordType.AREA: "area_{index}",
+    RecordType.INPUT: "input_{index}",
+    RecordType.OUTPUT: "output_{index}",
+    RecordType.TROUBLE_INPUT: "trouble_{index}",
+}
+
+
+def legacy_unique_id(record: Record, key: str) -> str:
+    """Unique ID a 1.x entity used, so an upgrade keeps that entity and its entity_id."""
+    template = _LEGACY_UNIQUE.get((record.record_type, key))
+    if template:
+        return template.format(index=record.index)
+    device = _LEGACY_DEVICE[record.record_type].format(index=record.index)
+    return f"ict_{device}_{key}"
+
+
+def legacy_device_id(record: Record) -> str:
+    return _LEGACY_DEVICE[record.record_type].format(index=record.index)
+
+
+def _copy_saved_fields(current: Record, old: Record) -> None:
+    if not current.name and old.name:
+        current.name = old.name
+    if current.reference is None and old.reference:
+        current.reference = old.reference
+    if current.areas is None and old.areas is not None:
+        current.areas = list(old.areas)
+    if current.arm_open is None and old.arm_open is not None:
+        current.arm_open = list(old.arm_open)
+
+
+def merge_records(
+    discovered: list[Record],
+    saved: list[Record],
+    pinned: list[Record],
+    absent: set[tuple[RecordType, int]],
+    *,
+    authoritative: bool,
+) -> list[Record]:
+    """Combine a scan with saved and hand-entered records.
+
+    Pinned records (typed in, or brought across from 1.x) are never removed. A saved
+    record is removed only when this scan proved the index does not exist, or when the
+    WX web interface listed every record and this one was not among them.
+    """
+    by_key = {r.key: r for r in discovered}
+    pinned_keys = {r.key for r in pinned}
+    for old in saved:
+        current = by_key.get(old.key)
+        if current is not None:
+            _copy_saved_fields(current, old)
+            continue
+        if old.key in pinned_keys:
+            continue
+        if authoritative or old.key in absent:
+            continue
+        by_key[old.key] = old
+    for old in pinned:
+        current = by_key.get(old.key)
+        if current is None:
+            by_key[old.key] = old
+        else:
+            _copy_saved_fields(current, old)
+    return sorted(by_key.values(), key=lambda r: (r.record_type.value, r.index))
+
+
+def parse_id_list(text: str) -> list[tuple[int, str | None]]:
+    """Parse '0, 12-20, 19=Garage light' into (index, optional name) pairs.
+
+    Ranges are inclusive. A later entry for the same index replaces an earlier one.
+    """
+    found: dict[int, str | None] = {}
+    for part in text.replace(";", ",").split(","):
+        token = part.strip()
+        if not token:
+            continue
+        name: str | None = None
+        body = token
+        if "=" in token:
+            body, _, raw_name = token.partition("=")
+            name = raw_name.strip() or None
+            body = body.strip()
+        span = body.replace("–", "-").replace("—", "-")
+        try:
+            if "-" in span:
+                start_s, end_s = span.split("-", 1)
+                start, end = int(start_s.strip()), int(end_s.strip())
+                if start < 0 or end < start or end - start > 512:
+                    raise ValueError
+                for index in range(start, end + 1):
+                    found[index] = name
+            else:
+                index = int(span)
+                if index < 0:
+                    raise ValueError
+                found[index] = name
+        except ValueError:
+            raise ValueError(token) from None
+    return list(found.items())
+
+
+def format_id_list(records: list[Record]) -> str:
+    parts = []
+    for record in sorted(records, key=lambda r: r.index):
+        parts.append(f"{record.index}={record.name}" if record.name else str(record.index))
+    return ", ".join(parts)
+
+
+def manual_records_from_options(options: dict[str, Any]) -> list[Record]:
+    return records_from_data(list(options.get(CONF_MANUAL_RECORDS) or []))
+
+
+def pins_for(entry: ConfigEntry) -> list[Record]:
+    """Hand-entered records, plus anything migrated from 1.x. A scan cannot drop these."""
+    pinned = manual_records_from_options(entry.options)
+    legacy = set(entry.data.get(CONF_LEGACY_KEYS) or [])
+    have = {r.key for r in pinned}
+    for record in records_from_data(entry.data.get(CONF_RECORDS, [])):
+        if legacy_key(record) in legacy and record.key not in have:
+            pinned.append(record)
+    return pinned
+
+
 async def async_discover_records(
     hass: HomeAssistant, entry: ConfigEntry, client: ProtegeClient
 ) -> list[Record]:
@@ -145,24 +288,30 @@ async def async_discover_records(
 
     When an operator login is configured, the web interface is read first (one login):
     its record IDs tell discovery which records to read, and give names and zone settings.
-    Names saved from the last successful read are used when it can't be reached.
+    If that read fails (Protege GX has no WX web interface), names stay generic.
+
+    Saved IDs are probed even past the gap, but they are not treated as the complete list.
+    Passing them as `listed` made a gapped panel look finished and the next start never
+    looked for the records the previous scan had missed. Hand-entered and 1.x records are
+    pinned: a scan cannot delete them.
     """
     site = await _async_read_site(hass, entry)
-    saved = {r.key: r for r in records_from_data(entry.data.get(CONF_RECORDS, []))}
-    listed: dict[RecordType, list[int]] = {}
+    saved = records_from_data(entry.data.get(CONF_RECORDS, []))
+    pinned = pins_for(entry)
+    extra = [(r.record_type, r.index) for r in [*saved, *pinned]]
+    try:
+        gap = int(entry.options.get(CONF_DISCOVERY_GAP, DEFAULT_DISCOVERY_GAP))
+    except (TypeError, ValueError):
+        gap = DEFAULT_DISCOVERY_GAP
+    listed: dict[RecordType, list[int]] | None = None
     if site is not None:
+        listed = {}
         for record_type, items in site.lists.items():
             listed[record_type] = [rec_id for rec_id, _ in items if rec_id not in NO_RECORD]
-    else:
-        # Without the web interface, the records found last time still tell how the panel numbers them.
-        for record_type, index in saved:
-            listed.setdefault(record_type, []).append(index)
-    records = await client.discover(listed=listed or None)
-    for record in records:
-        if (old := saved.get(record.key)) is not None:
-            record.name = record.name or old.name
-            record.areas = old.areas if record.areas is None else record.areas
-            record.arm_open = old.arm_open if record.arm_open is None else record.arm_open
+    records = await client.discover(listed=listed or None, extra=extra, gap_tolerance=gap)
+    if entry.data.get(CONF_NUMBERING):
+        # Keep the numbering this entry was created with, so unique IDs do not change.
+        client.numbering = entry.data[CONF_NUMBERING]
     if site is not None:
         by_id = client.numbering == NUMBERING_RECORD_ID
         named = apply_names(records, site.lists, by_id=by_id)
@@ -173,7 +322,9 @@ async def async_discover_records(
             named,
             zoned,
         )
-    return records
+    return merge_records(
+        records, saved, pinned, set(client.last_absent), authoritative=site is not None
+    )
 
 
 async def _async_read_site(hass: HomeAssistant, entry: ConfigEntry) -> WXSite | None:
@@ -190,8 +341,8 @@ async def _async_read_site(hass: HomeAssistant, entry: ConfigEntry) -> WXSite | 
     )
     try:
         return await client.fetch_site()
-    except WXError as err:
-        _LOGGER.warning("Could not read names from the WX web interface: %s", err)
+    except Exception as err:  # noqa: BLE001 — GX has no WX API; any failure falls back to generic names
+        _LOGGER.warning("Could not read names from the web interface (%s); using generic names", err)
         return None
 
 
@@ -255,8 +406,13 @@ class ProtegeHub:
         # Anything reached through the WX web interface is a WX.
         has_web = self.web or bool(self.entry.options.get(CONF_WX_USERNAME))
         fw_type = "WX" if has_web else (self.panel.firmware_type or "WX")
+        identifiers = {(DOMAIN, self.serial)}
+        # 1.x addressed the controller as ict_controller. Keep that identifier so the
+        # existing device (and the areas children point at) is reused.
+        if self.legacy_keys:
+            identifiers.add((DOMAIN, "ict_controller"))
         return DeviceInfo(
-            identifiers={(DOMAIN, self.serial)},
+            identifiers=identifiers,
             name=f"Protege {fw_type}",
             manufacturer=MANUFACTURER,
             model=f"Protege {fw_type} controller",
@@ -292,13 +448,28 @@ class ProtegeHub:
         ACPUseDisplayOrder) rather than 1, 2, 3 in display order."""
         return self.web or self.entry.data.get(CONF_NUMBERING) == NUMBERING_RECORD_ID
 
+    @property
+    def legacy_keys(self) -> set[str]:
+        return set(self.entry.data.get(CONF_LEGACY_KEYS) or [])
+
+    def is_legacy(self, record: Record) -> bool:
+        return legacy_key(record) in self.legacy_keys
+
+    def entity_unique_id(self, record: Record, key: str) -> str:
+        """1.x entities keep ict_door_0 / ict_area_1 so Home Assistant does not create new ones."""
+        if self.is_legacy(record):
+            return legacy_unique_id(record, key)
+        return f"{self.record_device_id(record)}_{key}"
+
     def record_device_id(self, record: Record) -> str:
         """Also the prefix of the record's entity unique IDs.
 
         Record IDs get an "id" marker, so a record numbered one way can never take over
         the entity of a different record numbered the other way (door 1 by display order is
-        not door ID 1).
+        not door ID 1). Records migrated from 1.x keep that version's device id (door_0).
         """
+        if self.is_legacy(record):
+            return legacy_device_id(record)
         return record_id_prefix(self.serial, record.record_type, record.index, self.by_record_id)
 
     @property
@@ -737,7 +908,14 @@ def link_child_devices(hass: HomeAssistant, hub: ProtegeHub) -> None:
     dev_reg = dr.async_get(hass)
     devices = dr.async_entries_for_config_entry(dev_reg, hub.entry.entry_id)
     # Look the controller up within this entry: async_get_device is deprecated.
-    controller = next((d for d in devices if (DOMAIN, hub.serial) in d.identifiers), None)
+    controller = next(
+        (
+            d
+            for d in devices
+            if (DOMAIN, hub.serial) in d.identifiers or (DOMAIN, "ict_controller") in d.identifiers
+        ),
+        None,
+    )
     if controller is None:
         return
     by_identifier = {ident: d for d in devices for ident in d.identifiers}
@@ -759,6 +937,8 @@ def remove_stale_devices(hass: HomeAssistant, hub: ProtegeHub) -> None:
     """Drop devices for records that no longer exist on the panel."""
     dev_reg = dr.async_get(hass)
     valid = {(DOMAIN, hub.serial)}
+    if hub.legacy_keys:
+        valid.add((DOMAIN, "ict_controller"))
     for record in hub.records:
         if record.record_type is not RecordType.TROUBLE_INPUT:
             valid.add((DOMAIN, hub.record_device_id(record)))

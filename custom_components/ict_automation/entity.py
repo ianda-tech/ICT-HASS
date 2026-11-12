@@ -6,6 +6,11 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import Entity
 
+try:
+    from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+except ImportError:  # Home Assistant 2025.1 names this callback the same for every platform
+    from homeassistant.helpers.entity_platform import AddEntitiesCallback as AddConfigEntryEntitiesCallback
+
 from .const import DOMAIN
 from .hub import ProtegeHub
 from .protege import ProtegeError, Record, RecordType
@@ -20,7 +25,7 @@ class ProtegeEntity(Entity):
     def __init__(self, hub: ProtegeHub, record: Record, key: str, device: DeviceInfo) -> None:
         self.hub = hub
         self.record = record
-        self._attr_unique_id = f"{hub.record_device_id(record)}_{key}"
+        self._attr_unique_id = hub.entity_unique_id(record, key)
         self._attr_device_info = device
 
     @property
@@ -51,4 +56,4 @@ def module_entity_name(record: Record) -> str:
     return record.default_name
 
 
-__all__ = ["ProtegeEntity", "RecordType", "module_entity_name"]
+__all__ = ["AddConfigEntryEntitiesCallback", "ProtegeEntity", "RecordType", "module_entity_name"]

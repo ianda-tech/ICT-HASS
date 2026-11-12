@@ -50,3 +50,14 @@ CONF_NUMBERING = "numbering"
 CODE_MODE_HA = "ha_codes"  # codes kept (hashed) by the integration
 CODE_MODE_NONE = "none"  # no code; Home Assistant's own permissions only
 CONF_CODES = "codes"
+
+# Record IDs typed in the options flow. Discovery never removes these.
+CONF_MANUAL_RECORDS = "manual_records"
+# Missing IDs in a row before a scan of that record type stops. 0 scans the full range.
+CONF_DISCOVERY_GAP = "discovery_gap"
+# "door:0" keys whose entities must keep the 1.x unique IDs (ict_door_0, ict_area_1, ...).
+CONF_LEGACY_KEYS = "legacy_keys"
+
+# The 2.0–2.2 scan stopped after 3 misses and started at ID 1, so a door at ID 0 and
+# anything after a short hole (empty inputs, outputs that start in the teens) disappeared.
+DEFAULT_DISCOVERY_GAP = 64

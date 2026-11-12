@@ -18,12 +18,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_platform
-from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import ProtegeConfigEntry
 from .codes import match_code
 from .const import ARM_MODES, CODE_MODE_HA, CONF_CODE_MODE, CONF_CODES, DOMAIN
-from .entity import ProtegeEntity
+from .entity import AddConfigEntryEntitiesCallback, ProtegeEntity
 from .protege import AreaState, AreaStatus, ProtegeError, RecordType
 from .protege import protocol as p
 

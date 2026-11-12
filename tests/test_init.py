@@ -275,8 +275,12 @@ async def test_migrates_v1_entry(hass: HomeAssistant, panel: FakePanel) -> None:
     assert entry.version == 2
     assert entry.data[CONF_PIN] == "1234"
     assert entry.unique_id == "00A1B2C3"
-    assert ent_reg.async_get_entity_id("lock", DOMAIN, "ict_door_1") is None
-    assert hass.states.get("lock.door_1") is not None
+    # 1.x unique id is kept, so the old entity is the door rather than a new one beside it.
+    lock_id = ent_reg.async_get_entity_id("lock", DOMAIN, "ict_door_1")
+    assert lock_id is not None
+    assert hass.states.get(lock_id).state == "locked"
+    assert ent_reg.async_get_entity_id("lock", DOMAIN, "00A1B2C3_door_1_lock") is None
+    assert ent_reg.async_get_entity_id("lock", DOMAIN, "00A1B2C3_door_id1_lock") is None
     await hass.config_entries.async_unload(entry.entry_id)
 
 

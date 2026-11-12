@@ -11,12 +11,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_platform
-from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from . import ProtegeConfigEntry
 from .const import ARM_MODES, DOMAIN
-from .entity import ProtegeEntity
+from .entity import AddConfigEntryEntitiesCallback, ProtegeEntity
 from .protege import RecordType
 
 SERVICE_TURN_ON_FOR = "turn_on_for"

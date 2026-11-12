@@ -10,10 +10,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_platform
-from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import ProtegeConfigEntry
-from .entity import ProtegeEntity
+from .entity import AddConfigEntryEntitiesCallback, ProtegeEntity
 from .protege import DoorLockState, DoorStatus, RecordType
 
 SERVICE_UNLOCK_FOR = "unlock_for"

@@ -11,20 +11,36 @@ from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_USERNA
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 
-from .const import CONF_CONNECTION, CONF_NUMBERING, CONF_PIN, CONF_RECORDS, CONNECTION_WEB, DOMAIN
+from .const import (
+    CONF_CONNECTION,
+    CONF_DISCOVERY_GAP,
+    CONF_LEGACY_KEYS,
+    CONF_MANUAL_RECORDS,
+    CONF_NUMBERING,
+    CONF_PIN,
+    CONF_RECORDS,
+    CONNECTION_ACS,
+    CONNECTION_WEB,
+    DEFAULT_DISCOVERY_GAP,
+    DOMAIN,
+)
 from .hub import (
     ProtegeHub,
     async_discover_records,
     door_unlock_store,
+    legacy_key,
     link_child_devices,
+    merge_records,
+    pins_for,
+    records_from_data,
     records_to_data,
     remove_stale_devices,
 )
-from .protege import ProtegeClient, ProtegeError
+from .protege import ProtegeClient, ProtegeError, Record, RecordType
+from .protege.client import NUMBERING_RECORD_ID
 from .protege.web import ProtegeWebClient, WebAuthError
 from .upgrade import CHECK_INTERVAL, async_check_control_service, session_store
 
@@ -67,7 +83,13 @@ async def _async_setup_web_client(hass: HomeAssistant, entry: ProtegeConfigEntry
     entry.async_on_unload(client.add_cookie_listener(save_cookie))
     try:
         await client.connect()
-        records = await client.discover()
+        records = merge_records(
+            await client.discover(),
+            records_from_data(entry.data.get(CONF_RECORDS, [])),
+            pins_for(entry),
+            set(),
+            authoritative=True,
+        )
     except WebAuthError as err:
         raise ConfigEntryAuthFailed(str(err)) from err
     except ProtegeError as err:
@@ -158,22 +180,72 @@ async def async_unload_entry(hass: HomeAssistant, entry: ProtegeConfigEntry) -> 
     return unloaded
 
 
+_V1_DROPPED_OPTIONS = {
+    "troubles",
+    "enable_arm_away",
+    "enable_arm_stay",
+    "enable_arm_night",
+    "enable_arm_bypass",
+}
+
+_V1_SECTIONS = {
+    "doors": RecordType.DOOR,
+    "areas": RecordType.AREA,
+    "inputs": RecordType.INPUT,
+    "outputs": RecordType.OUTPUT,
+}
+
+
+def _records_from_v1(options: dict[str, Any]) -> list[Record]:
+    """1.x stored hand-entered records as {id: name} dicts on the options."""
+    records: list[Record] = []
+    for key, record_type in _V1_SECTIONS.items():
+        raw = options.get(key) or {}
+        if not isinstance(raw, dict):
+            continue
+        for idx, name in raw.items():
+            try:
+                index = int(idx)
+            except (TypeError, ValueError):
+                _LOGGER.warning("Skipping 1.x %s id %r", key, idx)
+                continue
+            text = str(name).strip() if name else ""
+            records.append(Record(record_type, index, name=text or None))
+    return records
+
+
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Migrate entries made by the 1.x integration."""
-    if entry.version == 1:
-        # 1.x kept hand-entered records in options and used different unique IDs.
-        # Start clean: keep the connection details, drop the old entities and devices.
-        ent_reg = er.async_get(hass)
-        for entity in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
-            ent_reg.async_remove(entity.entity_id)
-        dev_reg = dr.async_get(hass)
-        for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
-            dev_reg.async_remove_device(device.id)
-        data = {
-            CONF_HOST: entry.data[CONF_HOST],
-            CONF_PORT: int(entry.data.get(CONF_PORT, 21000)),
-            CONF_PIN: str(entry.data.get("password", "")),
-        }
-        hass.config_entries.async_update_entry(entry, data=data, options={}, version=2)
-        _LOGGER.info("Migrated ICT Protege entry %s to version 2", entry.title)
+    """Migrate entries made by the 1.x integration without dropping its entities.
+
+    2.0–2.2 deleted every entity and device and cleared the hand-entered records, then
+    rediscovered from ID 1 and stopped after three misses. 1.x unique IDs (ict_area_1,
+    ict_door_0, ...) and the records themselves are kept, and those records are pinned
+    so a later scan cannot remove them.
+    """
+    if entry.version != 1:
+        return True
+    records = _records_from_v1(dict(entry.options))
+    data = {
+        CONF_HOST: entry.data[CONF_HOST],
+        CONF_PORT: int(entry.data.get(CONF_PORT, 21000)),
+        CONF_PIN: str(entry.data.get("password") or entry.data.get(CONF_PIN) or ""),
+        CONF_CONNECTION: CONNECTION_ACS,
+        CONF_NUMBERING: NUMBERING_RECORD_ID,
+        CONF_RECORDS: records_to_data(records),
+        CONF_LEGACY_KEYS: [legacy_key(r) for r in records],
+    }
+    # Keep any option that is not a 1.x record map. The record maps move to manual_records.
+    options = {
+        k: v
+        for k, v in entry.options.items()
+        if k not in _V1_SECTIONS and k not in _V1_DROPPED_OPTIONS
+    }
+    options[CONF_MANUAL_RECORDS] = records_to_data(records)
+    options.setdefault(CONF_DISCOVERY_GAP, DEFAULT_DISCOVERY_GAP)
+    hass.config_entries.async_update_entry(entry, data=data, options=options, version=2)
+    _LOGGER.info(
+        "Migrated ICT Protege entry %s to version 2, keeping %d records and their entity IDs",
+        entry.title,
+        len(records),
+    )
     return True

@@ -281,7 +281,10 @@ def _reference(body: bytes) -> str:
 def decode_status(block: p.ICTDataBlock) -> StatusUpdate | None:
     """Decode a record status data block, or return None for other blocks."""
     record_type = RecordType.from_group(block.type_high)
-    if record_type is None or block.type_low != 0x00 or len(block.body) < 6:
+    if record_type is None or block.type_low != 0x00:
+        return None
+    # Areas can be index + state only. Doors need a lock byte and a position byte.
+    if len(block.body) < (5 if record_type is RecordType.AREA else 6):
         return None
     body = block.body
     index = struct.unpack("<I", body[0:4])[0]
@@ -289,9 +292,22 @@ def decode_status(block: p.ICTDataBlock) -> StatusUpdate | None:
     if record_type is RecordType.DOOR:
         status = DoorStatus(_enum_or_int(DoorLockState, body[4]), _enum_or_int(DoorState, body[5]))
     elif record_type is RecordType.AREA:
-        if len(body) < 7:
+        # 2014 ACS layout is 8 bytes: index, area state, tamper, flags, spare.
+        # Protege GX (seen from 1.7.0 staying "unknown", and from discovery timing out
+        # on area 1) answers with a shorter block. 1.7.0 indexed body[6] inside a bare
+        # except, so a 5- or 6-byte body was dropped and the alarm entity never left
+        # its initial None. State is still the first byte after the index; a 6-byte
+        # body carries flags in the next byte and no tamper byte.
+        if len(body) < 5:
             return None
-        status = AreaStatus(_enum_or_int(AreaState, body[4]), body[5], body[6])
+        state = body[4]
+        if len(body) >= 7:
+            tamper, flags = body[5], body[6]
+        elif len(body) == 6:
+            tamper, flags = 0, body[5]
+        else:
+            tamper, flags = 0, 0
+        status = AreaStatus(_enum_or_int(AreaState, state), tamper, flags)
     elif record_type is RecordType.OUTPUT:
         if len(body) < 13:
             return None

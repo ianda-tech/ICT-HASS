@@ -7,10 +7,9 @@ from typing import Any
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass, BinarySensorEntity
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import ProtegeConfigEntry
-from .entity import ProtegeEntity
+from .entity import AddConfigEntryEntitiesCallback, ProtegeEntity
 from .protege import InputState, RecordType
 
 
