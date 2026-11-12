@@ -4,13 +4,19 @@ from __future__ import annotations
 
 from typing import Any
 
+import voluptuous as vol
 from homeassistant.components.lock import LockEntity, LockEntityFeature
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_platform
 
 from . import ProtegeConfigEntry
-from .entity import ProtegeEntity
+from .entity import AddConfigEntryEntitiesCallback, ProtegeEntity
 from .protege import DoorLockState, DoorStatus, RecordType
+
+SERVICE_UNLOCK_FOR = "unlock_for"
+ATTR_DURATION = "duration"
 
 
 async def async_setup_entry(
@@ -18,6 +24,13 @@ async def async_setup_entry(
 ) -> None:
     hub = entry.runtime_data
     async_add_entities(ProtegeDoorLock(hub, r) for r in hub.records_of(RecordType.DOOR))
+
+    platform = entity_platform.async_get_current_platform()
+    platform.async_register_entity_service(
+        SERVICE_UNLOCK_FOR,
+        {vol.Required(ATTR_DURATION): vol.All(cv.time_period, cv.positive_timedelta)},
+        "async_unlock_for",
+    )
 
 
 class ProtegeDoorLock(ProtegeEntity, LockEntity):
@@ -47,13 +60,40 @@ class ProtegeDoorLock(ProtegeEntity, LockEntity):
         if status is None:
             return None
         state = status.lock_state
-        return {"lock_reason": state.name.lower() if isinstance(state, DoorLockState) else state}
+        attributes: dict[str, Any] = {
+            "lock_reason": state.name.lower() if isinstance(state, DoorLockState) else state
+        }
+        # Only after the controller has reported the door unlocked, not from the assumed state.
+        if (remaining := self.hub.unlock_remaining(self.record.index)) is not None:
+            attributes["unlock_until"], attributes["remaining"] = remaining
+        return attributes
 
     async def async_lock(self, **kwargs: Any) -> None:
-        await self._run(self.hub.client.door_lock(self.record.index))
+        suspended = await self.hub.async_cancel_relock(self.record.index)
+        try:
+            await self._run(self.hub.client.door_lock(self.record.index))
+        except HomeAssistantError:
+            if suspended is not None:
+                await self.hub.async_resume_relock(self.record.index, suspended)
+            raise
 
     async def async_unlock(self, **kwargs: Any) -> None:
         await self._run(self.hub.client.door_unlock_latched(self.record.index))
 
     async def async_open(self, **kwargs: Any) -> None:
         await self._run(self.hub.client.door_unlock(self.record.index))
+
+    async def async_unlock_for(self, duration) -> None:
+        """Unlock for `duration`, then lock.
+
+        Neither the control service nor the web interface accepts a duration on a door
+        unlock: momentary unlock uses the door's programmed lock activation time. Latch
+        the door and lock it again when the time is up.
+        """
+        seconds = max(1, min(65535, int(duration.total_seconds())))
+        await self.hub.async_schedule_relock(self.record.index, seconds)
+        try:
+            await self._run(self.hub.client.door_unlock_latched(self.record.index))
+        except HomeAssistantError:
+            await self.hub.async_forget_relock(self.record.index)
+            raise

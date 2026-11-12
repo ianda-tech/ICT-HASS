@@ -44,6 +44,9 @@ class FakePanel:
         # Inputs that must be closed (or bypassed) for an area to arm, as the panel's input types set it.
         self.must_close: set[int] = set()
         self.serial = 0x00A1B2C3
+        # "short": area status is index + state + flags (no tamper byte), as GX replies.
+        # "reject": status requests for areas are refused; monitoring still pushes the state.
+        self.area_status = "normal"
         self.commands: list[tuple[int, int, int]] = []
         self.acks_received = 0
         self.accept_ack_config = True
@@ -80,7 +83,11 @@ class FakePanel:
         if group == p.GROUP_DOOR:
             body = idx + bytes((rec[0], rec[1], 0, 0))
         elif group == p.GROUP_AREA:
-            body = idx + bytes((rec[0], rec[1], rec[2], 0))
+            if self.area_status == "short":
+                # 6 bytes: state, then the flag byte. No tamper byte.
+                body = idx + bytes((rec[0], rec[2]))
+            else:
+                body = idx + bytes((rec[0], rec[1], rec[2], 0))
         elif group == p.GROUP_OUTPUT:
             body = idx + rec[0].encode() + bytes((rec[1], 0, 0, 0))
         else:
@@ -144,6 +151,8 @@ class FakePanel:
         index = struct.unpack("<I", payload[:4])[0]
         table = self._table(group)
         if sub == p.SUB_STATUS:
+            if group == p.GROUP_AREA and self.area_status == "reject":
+                return [self._nack(p.NACK_SERVICE_COMMAND_NOT_VALID)]
             if s.user is None and not self.allow_status_logged_out:
                 return [self._nack(p.NACK_USER_LOGOUT)]
             if index not in table:

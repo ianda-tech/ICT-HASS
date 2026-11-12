@@ -151,8 +151,17 @@ PIR changes its sensor within a couple of seconds.
 
 **Configure** (the cog on the integration) has:
 
-* **Control service**: the WX operator, and event logging (the events port and the events user's PIN).
-* **Web interface only**: arming codes, and *Switch to the Automation and Control service*.
+* **Record IDs and discovery** (control service): how many empty record IDs to walk past (64 by default, 0 for a full scan), and door, area, input and output IDs to pin. Pinned IDs are never removed by a scan. Write `0`, `12-20` or `19=Garage light`.
+* **Control service**: the WX operator (optional; Protege GX will not have one), and event logging (the events port and the events user's PIN).
+* **Web interface only**: record IDs, arming codes, and *Switch to the Automation and Control service*.
+
+### Protege GX
+
+Protege GX does not serve the WX HTTPS operator API this integration uses for names. Leave the operator blank, or ignore a rejected login when the Automation and Control service answers: setup continues, and records are named from the controller instead (`Door 0`, `Area 1`, `Input CP001:02`). Rename the device or entity in Home Assistant; that name is kept.
+
+Record IDs on GX are the database IDs and they have holes. The first door is often ID 0. Onboard inputs can be `CP001:02`–`CP001:08` with IDs 8–11 empty and expander inputs at 12 and up. Outputs often start around ID 19. Discovery starts at 0 and continues through 64 empty IDs (change that under **Configure**). Add any ID it still misses in the same place. Those IDs stay even if a later scan does not see them.
+
+Areas report armed and disarmed from the control service. A status reply that is shorter than the 2014 layout, or that arrives only after monitoring is turned on, is still applied. The alarm panel should show armed or disarmed rather than unknown.
 
 ## What you get
 
@@ -174,8 +183,23 @@ grouped under the module they are wired to. Names come from the panel; anything 
 **Duress, panic and medical** alarms raise a critical alert under **Settings > Repairs** until you mark it handled, and fire an
 `ict_automation_emergency` event for automations. With the control service this needs event logging set up.
 
-**Actions**: `ict_automation.force_arm` (alarm panel), `ict_automation.turn_on_for` (output, with a duration) and
-`ict_automation.bypass` (bypass switch, optionally permanent).
+**Actions**: `ict_automation.force_arm` (alarm panel), `ict_automation.turn_on_for` (output, with a duration),
+`ict_automation.unlock_for` (lock, with a duration) and `ict_automation.bypass` (bypass switch, optionally permanent).
+
+**Timed unlock** (`ict_automation.unlock_for`): unlocks a door for the duration you give, then locks it.
+The control service and the web interface both have a momentary unlock, but it uses the door's programmed lock
+activation time and has no duration field, so this action unlocks the door latched and sends lock when the time
+is up. Locking the door from Home Assistant cancels that timer; if the panel rejects the lock, the timer is put
+back. The schedule is stored and resumed after a restart (if Home Assistant was stopped past the end time, it
+locks as soon as it is talking to the panel again). While the controller reports the door unlocked, the lock
+entity has `unlock_until` (UTC) and `remaining` (whole seconds). Those attributes follow the controller's
+reported status, not the moment the command was sent.
+
+The same status changes fire `ict_automation_door` for automations, including unlocks Home Assistant did not
+start. `action` is `unlocked`, `opened`, `closed` or `relocked`. `door` is the door's name, `source` is who or
+what caused it (`home_assistant` for this action, otherwise `user`, `schedule`, `rex`, `keypad`, `latched`,
+`forced`, `controller`, …) and `duration` is the number of seconds when this action started the timer. This
+event comes from door status, so it does not need the separate events service.
 
 ### Seeing events
 
@@ -185,6 +209,8 @@ In web-only mode, or with event logging on the control service, every panel even
   Its types are `access_granted`, `access_denied`, `armed`, `disarmed`, `alarm`, `door`, `input`, `output`, `user`, `trouble` and `other`.
 * The **Activity** (logbook) page, as readable text such as *User Dave Entry Granted Front Door Using User By Card*.
 * The `ict_automation_event` bus event, with `text`, `category`, `user` and `code`, for automations.
+* Door lock and contact changes also fire `ict_automation_door` (`action`, `door`, `source`, `duration`),
+  from the door's reported status. That one does not need event logging.
 
 Card numbers are removed from event text so they don't end up in Home Assistant's history.
 
@@ -268,7 +294,14 @@ should only have the rights Home Assistant needs.
 <details>
 <summary>Upgrading from 2.x</summary>
 
-Just update and restart: existing installs keep running on the control service with the same devices and entities.
+Update and restart. Devices and entities you already have keep their IDs. The next start scans from record ID 0 through
+gaps, so a door at ID 0, an area the old scan missed, expander inputs and outputs that start after empty IDs show up as
+new entities. Rename the generic ones in Home Assistant.
+
+If 2.0.0–2.2.0 already migrated a 1.x install, that older migration deleted the hand-entered entities. This version cannot
+put those back. Restore a backup from before that upgrade and update straight to 2.3.0, or add the record IDs under
+**Configure > Record IDs and discovery**.
+
 To move between web-only and the control service, use **Configure > Switch to the Automation and Control service** rather
 than deleting and re-adding the integration, because the two number some records differently and the switch maps them for you.
 </details>
@@ -276,8 +309,11 @@ than deleting and re-adding the integration, because the two number some records
 <details>
 <summary>Upgrading from 1.x</summary>
 
-Existing entries are migrated automatically: the connection details are kept, the old hand-entered doors, areas, inputs and
-outputs are removed, and everything is re-created from the panel. Entity IDs change, so update dashboards and automations afterwards.
+Update straight to 2.3.0. The connection, the hand-entered doors, areas, inputs and outputs, their names, and their entity
+IDs are kept (`ict_door_0`, `ict_area_1`, `ict_input_2`, `ict_output_19`, and the door contact, input trouble and bypass
+entities). Those records are pinned, so the new scan cannot delete them. Dashboards and automations that use the old
+entity IDs keep working. New records the panel has, and new sensors this version adds (tamper, door state, arm-mode
+switches), appear alongside them.
 </details>
 
 ## Development

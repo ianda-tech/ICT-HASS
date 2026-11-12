@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from homeassistant.config_entries import ConfigEntryState
@@ -13,7 +14,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.ict_automation.const import CONF_PIN, CONF_RECORDS, DOMAIN
+from custom_components.ict_automation.const import CONF_PIN, CONF_RECORDS, DOMAIN, EVENT_DOOR
 from custom_components.ict_automation.protege import protocol as p
 
 from .fake_panel import FakePanel
@@ -105,6 +106,102 @@ async def test_lock_unlock_and_open(hass: HomeAssistant, entry, panel: FakePanel
     assert panel.commands == [(p.GROUP_DOOR, p.DOOR_UNLOCK_MOMENTARY, 1)]
 
 
+def _door_events(hass: HomeAssistant) -> list:
+    events = []
+    hass.bus.async_listen(EVENT_DOOR, events.append)
+    return events
+
+
+async def test_unlock_for_relocks_and_reports_the_controller(
+    hass: HomeAssistant, entry, panel: FakePanel
+) -> None:
+    events = _door_events(hass)
+    await hass.services.async_call(
+        DOMAIN, "unlock_for", {"entity_id": "lock.door_1", "duration": 4}, blocking=True
+    )
+    await hass.async_block_till_done()
+    assert (p.GROUP_DOOR, p.DOOR_UNLOCK_LATCHED, 1) in panel.commands
+    state = hass.states.get("lock.door_1")
+    assert state.state == "unlocked"
+    assert state.attributes["remaining"] > 0
+    assert state.attributes["unlock_until"]
+    unlocked = [e for e in events if e.data["action"] == "unlocked"]
+    assert len(unlocked) == 1
+    assert unlocked[0].data["door"] == "Door 1"
+    assert unlocked[0].data["source"] == "home_assistant"
+    assert unlocked[0].data["duration"] == 4
+
+    await asyncio.sleep(4.2)
+    await hass.async_block_till_done()
+    await _settle(hass, lambda: hass.states.get("lock.door_1").state == "locked")
+    assert (p.GROUP_DOOR, p.DOOR_LOCK, 1) in panel.commands
+    assert "remaining" not in hass.states.get("lock.door_1").attributes
+    relocked = [e for e in events if e.data["action"] == "relocked"]
+    assert len(relocked) == 1
+    assert relocked[0].data["source"] == "home_assistant"
+    assert relocked[0].data["duration"] == 4
+
+
+async def test_manual_lock_cancels_the_timer(hass: HomeAssistant, entry, panel: FakePanel) -> None:
+    await hass.services.async_call(
+        DOMAIN, "unlock_for", {"entity_id": "lock.door_1", "duration": 1}, blocking=True
+    )
+    await hass.services.async_call("lock", "lock", {"entity_id": "lock.door_1"}, blocking=True)
+    await _settle(hass, lambda: hass.states.get("lock.door_1").state == "locked")
+    locks = [c for c in panel.commands if c == (p.GROUP_DOOR, p.DOOR_LOCK, 1)]
+    await asyncio.sleep(1.2)
+    await hass.async_block_till_done()
+    assert [c for c in panel.commands if c == (p.GROUP_DOOR, p.DOOR_LOCK, 1)] == locks
+
+
+async def test_failed_unlock_for_does_not_relock_later(hass: HomeAssistant, entry, panel: FakePanel) -> None:
+    panel.users["1234"].doors = False
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call(
+            DOMAIN, "unlock_for", {"entity_id": "lock.door_1", "duration": 15}, blocking=True
+        )
+    panel.users["1234"].doors = True
+    assert entry.runtime_data._door_plans == {}
+    assert (p.GROUP_DOOR, p.DOOR_LOCK, 1) not in panel.commands
+    assert hass.states.get("lock.door_1").state == "locked"
+
+
+async def test_door_events_follow_reported_position(hass: HomeAssistant, entry, panel: FakePanel) -> None:
+    events = _door_events(hass)
+    panel.doors[1] = [1, 1]  # unlocked by a user, door open
+    panel.push(p.GROUP_DOOR, 1)
+    await _settle(hass, lambda: any(e.data["action"] == "opened" for e in events))
+    actions = [(e.data["action"], e.data["source"], e.data["duration"]) for e in events]
+    assert ("unlocked", "user", None) in actions
+    assert ("opened", "user", None) in actions
+
+    panel.doors[1] = [0, 4]  # locked, forced open
+    panel.push(p.GROUP_DOOR, 1)
+    await _settle(hass, lambda: any(e.data["action"] == "relocked" for e in events))
+    assert any(e.data["action"] == "relocked" and e.data["source"] == "controller" for e in events)
+
+    panel.doors[1] = [0, 0]
+    panel.push(p.GROUP_DOOR, 1)
+    await _settle(hass, lambda: any(e.data["action"] == "closed" for e in events))
+    assert any(e.data["action"] == "closed" and e.data["source"] == "locked" for e in events)
+
+
+async def test_unlock_for_survives_a_restart(
+    hass: HomeAssistant, entry, panel: FakePanel, hass_storage: dict
+) -> None:
+    await hass.services.async_call(
+        DOMAIN, "unlock_for", {"entity_id": "lock.door_1", "duration": 60}, blocking=True
+    )
+    assert (p.GROUP_DOOR, p.DOOR_LOCK, 1) not in panel.commands
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    stored = hass_storage[f"{DOMAIN}.{entry.entry_id}.door_unlocks"]
+    stored["data"]["doors"]["1"]["until"] = time.time() - 5
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    await _settle(hass, lambda: (p.GROUP_DOOR, p.DOOR_LOCK, 1) in panel.commands)
+
+
 async def test_arming_uses_the_persons_code(hass: HomeAssistant, entry, panel: FakePanel) -> None:
     with pytest.raises(ServiceValidationError):
         await hass.services.async_call(
@@ -178,8 +275,12 @@ async def test_migrates_v1_entry(hass: HomeAssistant, panel: FakePanel) -> None:
     assert entry.version == 2
     assert entry.data[CONF_PIN] == "1234"
     assert entry.unique_id == "00A1B2C3"
-    assert ent_reg.async_get_entity_id("lock", DOMAIN, "ict_door_1") is None
-    assert hass.states.get("lock.door_1") is not None
+    # 1.x unique id is kept, so the old entity is the door rather than a new one beside it.
+    lock_id = ent_reg.async_get_entity_id("lock", DOMAIN, "ict_door_1")
+    assert lock_id is not None
+    assert hass.states.get(lock_id).state == "locked"
+    assert ent_reg.async_get_entity_id("lock", DOMAIN, "00A1B2C3_door_1_lock") is None
+    assert ent_reg.async_get_entity_id("lock", DOMAIN, "00A1B2C3_door_id1_lock") is None
     await hass.config_entries.async_unload(entry.entry_id)
 
 

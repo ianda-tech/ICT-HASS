@@ -21,8 +21,10 @@ from .const import (
     CONF_CODES,
     CONF_CONNECTION,
     CONF_CONTROL_PORT,
+    CONF_DISCOVERY_GAP,
     CONF_EVENTS_PIN,
     CONF_EVENTS_PORT,
+    CONF_MANUAL_RECORDS,
     CONF_NUMBERING,
     CONF_PIN,
     CONF_RECORDS,
@@ -32,17 +34,33 @@ from .const import (
     CONF_WX_USERNAME,
     CONNECTION_ACS,
     CONNECTION_WEB,
+    DEFAULT_DISCOVERY_GAP,
     DEFAULT_PORT,
     DEFAULT_WX_PORT,
     DOMAIN,
 )
-from .hub import records_from_data, records_to_data
-from .protege import CannotConnect, InvalidPin, ProtegeClient, ProtegeError, ProtegeEventClient, RecordType
+from .hub import format_id_list, parse_id_list, records_from_data, records_to_data
+from .protege import (
+    CannotConnect,
+    InvalidPin,
+    ProtegeClient,
+    ProtegeError,
+    ProtegeEventClient,
+    Record,
+    RecordType,
+)
 from .protege.web import ProtegeWebClient, WebAuthError
 from .protege.wx import WXAuthError, WXClient, WXError
 from .upgrade import WrongPanel, async_upgrade, control_port, control_service_answers
 
 _LOGGER = logging.getLogger(__name__)
+
+_MANUAL_FIELDS = (
+    ("doors", RecordType.DOOR),
+    ("areas", RecordType.AREA),
+    ("inputs", RecordType.INPUT),
+    ("outputs", RecordType.OUTPUT),
+)
 
 PIN_SELECTOR = selector.TextSelector(selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD))
 PASSWORD_SELECTOR = PIN_SELECTOR
@@ -83,8 +101,8 @@ def _user_schema(defaults: dict[str, Any]) -> vol.Schema:
     return vol.Schema(
         {
             vol.Required(CONF_HOST, default=defaults.get(CONF_HOST, "")): str,
-            vol.Required(CONF_USERNAME, default=defaults.get(CONF_USERNAME, "")): str,
-            vol.Required(CONF_PASSWORD, default=defaults.get(CONF_PASSWORD, "")): PASSWORD_SELECTOR,
+            vol.Optional(CONF_USERNAME, default=defaults.get(CONF_USERNAME, "")): str,
+            vol.Optional(CONF_PASSWORD, default=defaults.get(CONF_PASSWORD, "")): PASSWORD_SELECTOR,
             vol.Required(CONF_PORT, default=defaults.get(CONF_PORT, DEFAULT_WX_PORT)): PORT_SELECTOR,
             vol.Required(
                 CONF_CONTROL_PORT, default=defaults.get(CONF_CONTROL_PORT, DEFAULT_PORT)
@@ -179,32 +197,35 @@ class ProtegeConfigFlow(ConfigFlow, domain=DOMAIN):
         """
         errors: dict[str, str] = {}
         if user_input is not None:
+            username = (user_input.get(CONF_USERNAME) or "").strip()
+            password = user_input.get(CONF_PASSWORD) or ""
             login = {
                 CONF_HOST: user_input[CONF_HOST].strip(),
                 CONF_PORT: int(user_input[CONF_PORT]),
-                CONF_USERNAME: user_input[CONF_USERNAME].strip(),
-                CONF_PASSWORD: user_input[CONF_PASSWORD],
+                CONF_USERNAME: username,
+                CONF_PASSWORD: password,
                 CONF_CONTROL_PORT: int(user_input[CONF_CONTROL_PORT]),
             }
             self._async_abort_entries_match({CONF_HOST: login[CONF_HOST]})
             self._web, self._web_error = None, None
-            try:
-                self._web = await _validate_web(self.hass, login)
-            except Exception as err:  # noqa: BLE001
-                self._web_error = err
-            # A wrong operator login is always worth fixing first.
+            # Protege GX has no WX HTTPS API. The operator is optional: a failure there
+            # must not block the Automation and Control service, and names fall back to
+            # "Door 0" / "Input CP001:02".
+            if username or password:
+                try:
+                    self._web = await _validate_web(self.hass, login)
+                except Exception as err:  # noqa: BLE001
+                    self._web_error = err
+                    _LOGGER.debug("Web interface not used: %s", err)
+            self._login = login
+            if await control_service_answers(login[CONF_HOST], login[CONF_CONTROL_PORT]):
+                return await self.async_step_acs()
             if isinstance(self._web_error, WebAuthError):
                 errors = _errors_for(self._web_error)
+            elif self._web_error is not None or not username:
+                errors = {"base": "nothing_found"}
             else:
-                self._login = login
-                if await control_service_answers(login[CONF_HOST], login[CONF_CONTROL_PORT]):
-                    return await self.async_step_acs()
-                if isinstance(self._web_error, CannotConnect):
-                    errors = {"base": "nothing_found"}
-                elif self._web_error is not None:
-                    errors = _errors_for(self._web_error)
-                else:
-                    return await self.async_step_web()
+                return await self.async_step_web()
         return self.async_show_form(step_id="user", data_schema=_user_schema(user_input or {}), errors=errors)
 
     async def async_step_acs(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
@@ -265,8 +286,8 @@ class ProtegeConfigFlow(ConfigFlow, domain=DOMAIN):
         names = (
             "Names and zone settings will be read with the web operator."
             if self._web is not None
-            else "The web interface could not be reached, so names come from module references "
-            "until you set an operator under Configure."
+            else "Names will be generic, such as Door 0 and Input CP001:02. "
+            "Rename them in Home Assistant; the WX web interface is not required."
         )
         return self.async_show_form(
             step_id="acs",
@@ -364,8 +385,55 @@ class ProtegeOptionsFlow(OptionsFlow):
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         if self.config_entry.data.get(CONF_CONNECTION) == CONNECTION_WEB:
             # Names and events already come from the web interface.
-            return self.async_show_menu(step_id="init", menu_options=["codes", "upgrade"])
-        return self.async_show_menu(step_id="init", menu_options=["names", "events"])
+            return self.async_show_menu(step_id="init", menu_options=["records", "codes", "upgrade"])
+        return self.async_show_menu(step_id="init", menu_options=["records", "names", "events"])
+
+    async def async_step_records(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Pin record IDs the scan should always keep, and how wide a gap to walk past."""
+        current = records_from_data(list(self.config_entry.options.get(CONF_MANUAL_RECORDS) or []))
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                gap = int(user_input.get(CONF_DISCOVERY_GAP, DEFAULT_DISCOVERY_GAP))
+            except (TypeError, ValueError):
+                gap = -1
+            if gap < 0 or gap > 512:
+                errors[CONF_DISCOVERY_GAP] = "invalid_gap"
+            records: list[Record] = []
+            for field, record_type in _MANUAL_FIELDS:
+                try:
+                    parsed = parse_id_list(str(user_input.get(field) or ""))
+                except ValueError:
+                    errors[field] = "invalid_ids"
+                    continue
+                records.extend(Record(record_type, index, name=name) for index, name in parsed)
+            if not errors:
+                return self._save(
+                    {CONF_MANUAL_RECORDS: records_to_data(records) or None, CONF_DISCOVERY_GAP: gap}
+                )
+        by_type = {
+            record_type: [r for r in current if r.record_type is record_type]
+            for _, record_type in _MANUAL_FIELDS
+        }
+        defaults = user_input or {}
+        schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_DISCOVERY_GAP,
+                    default=defaults.get(
+                        CONF_DISCOVERY_GAP, self.config_entry.options.get(CONF_DISCOVERY_GAP, DEFAULT_DISCOVERY_GAP)
+                    ),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0, max=512, mode=selector.NumberSelectorMode.BOX)
+                ),
+                **{
+                    vol.Optional(field, default=defaults.get(field, format_id_list(by_type[record_type]))): str
+                    for field, record_type in _MANUAL_FIELDS
+                },
+            }
+        )
+        return self.async_show_form(step_id="records", data_schema=schema, errors=errors)
+
 
     async def async_step_codes(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Web-only mode: whether arming needs a code, and whose codes are accepted."""

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from homeassistant.components.event import EventEntity
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import ProtegeConfigEntry
 from .const import EVENT_TYPES
+from .entity import AddConfigEntryEntitiesCallback
 from .hub import ProtegeHub
 from .protege import PanelEvent
 

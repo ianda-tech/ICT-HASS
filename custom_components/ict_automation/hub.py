@@ -7,6 +7,8 @@ import re
 import time
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -16,11 +18,17 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_CONNECTION,
+    CONF_DISCOVERY_GAP,
     CONF_EVENTS_PIN,
     CONF_EVENTS_PORT,
+    CONF_LEGACY_KEYS,
+    CONF_MANUAL_RECORDS,
     CONF_NUMBERING,
     CONF_PIN,
     CONF_RECORDS,
@@ -28,25 +36,33 @@ from .const import (
     CONF_WX_PORT,
     CONF_WX_USERNAME,
     CONNECTION_WEB,
+    DEFAULT_DISCOVERY_GAP,
     DEFAULT_WX_PORT,
     DOMAIN,
+    EVENT_DOOR,
     EVENT_EMERGENCY,
     EVENT_PANEL,
     MANUFACTURER,
 )
 from .protege import (
     AreaStatus,
+    CommandRejected,
+    DoorLockState,
+    DoorState,
+    DoorStatus,
     InputStatus,
     PanelEvent,
     PanelInfo,
     ProtegeClient,
+    ProtegeError,
     ProtegeEventClient,
     Record,
     RecordType,
     StatusUpdate,
 )
+from .protege import protocol as proto
 from .protege.client import NUMBERING_RECORD_ID
-from .protege.wx import NO_RECORD, WXClient, WXError, WXSite, apply_names, apply_zone_settings
+from .protege.wx import NO_RECORD, WXClient, WXSite, apply_names, apply_zone_settings
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +73,36 @@ ALARM_CAUSE_WINDOW = 90.0
 
 # Whole words, so a name like "Panic Room" only trips it as part of a real alarm line.
 _EMERGENCY = re.compile(r"\b(duress|panic|medical|hold[ -]?up)\b", re.IGNORECASE)
+
+# Who the controller says unlocked the door, when this integration did not.
+_LOCK_SOURCES = {
+    DoorLockState.UNLOCKED_USER: "user",
+    DoorLockState.UNLOCKED_SCHEDULE: "schedule",
+    DoorLockState.UNLOCKED_USER_TIMED: "user",
+    DoorLockState.UNLOCKED_LATCHED: "latched",
+    DoorLockState.UNLOCKED_REX: "rex",
+    DoorLockState.UNLOCKED_REN: "ren",
+    DoorLockState.UNLOCKED_KEYPAD: "keypad",
+    DoorLockState.UNLOCKED_AREA: "area",
+    DoorLockState.UNLOCKED_FIRE: "fire",
+}
+SOURCE_HOME_ASSISTANT = "home_assistant"
+RELOCK_RETRY = 15.0
+
+
+def door_unlock_store(hass: HomeAssistant, entry: ConfigEntry) -> Store[dict[str, Any]]:
+    """Pending unlock_for timers. Times only: no PINs or passwords."""
+    return Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.door_unlocks")
+
+
+@dataclass
+class DoorUnlockPlan:
+    """A timed unlock this integration started, kept until the controller reports locked."""
+
+    source: str
+    duration: int | None = None
+    until: float | None = None  # unix time; None once a manual lock has cancelled it
+    relock_requested: bool = False
 
 
 def emergency_kind(text: str | None) -> str | None:
@@ -96,6 +142,145 @@ def records_from_data(data: list[dict[str, Any]]) -> list[Record]:
     ]
 
 
+def legacy_key(record: Record) -> str:
+    return f"{record.record_type.value}:{record.index}"
+
+
+# 1.x unique IDs and device identifiers, keyed by the entity suffix passed to ProtegeEntity.
+_LEGACY_UNIQUE = {
+    (RecordType.DOOR, "lock"): "ict_door_{index}",
+    (RecordType.DOOR, "contact"): "ict_door_contact_{index}",
+    (RecordType.AREA, "area"): "ict_area_{index}",
+    (RecordType.INPUT, "input"): "ict_input_{index}",
+    (RecordType.INPUT, "tamper"): "ict_trouble_{index}",
+    (RecordType.INPUT, "bypass"): "ict_input_bypass_{index}",
+    (RecordType.OUTPUT, "output"): "ict_output_{index}",
+}
+_LEGACY_DEVICE = {
+    RecordType.DOOR: "door_{index}",
+    RecordType.AREA: "area_{index}",
+    RecordType.INPUT: "input_{index}",
+    RecordType.OUTPUT: "output_{index}",
+    RecordType.TROUBLE_INPUT: "trouble_{index}",
+}
+
+
+def legacy_unique_id(record: Record, key: str) -> str:
+    """Unique ID a 1.x entity used, so an upgrade keeps that entity and its entity_id."""
+    template = _LEGACY_UNIQUE.get((record.record_type, key))
+    if template:
+        return template.format(index=record.index)
+    device = _LEGACY_DEVICE[record.record_type].format(index=record.index)
+    return f"ict_{device}_{key}"
+
+
+def legacy_device_id(record: Record) -> str:
+    return _LEGACY_DEVICE[record.record_type].format(index=record.index)
+
+
+def _copy_saved_fields(current: Record, old: Record) -> None:
+    if not current.name and old.name:
+        current.name = old.name
+    if current.reference is None and old.reference:
+        current.reference = old.reference
+    if current.areas is None and old.areas is not None:
+        current.areas = list(old.areas)
+    if current.arm_open is None and old.arm_open is not None:
+        current.arm_open = list(old.arm_open)
+
+
+def merge_records(
+    discovered: list[Record],
+    saved: list[Record],
+    pinned: list[Record],
+    absent: set[tuple[RecordType, int]],
+    *,
+    authoritative: bool,
+) -> list[Record]:
+    """Combine a scan with saved and hand-entered records.
+
+    Pinned records (typed in, or brought across from 1.x) are never removed. A saved
+    record is removed only when this scan proved the index does not exist, or when the
+    WX web interface listed every record and this one was not among them.
+    """
+    by_key = {r.key: r for r in discovered}
+    pinned_keys = {r.key for r in pinned}
+    for old in saved:
+        current = by_key.get(old.key)
+        if current is not None:
+            _copy_saved_fields(current, old)
+            continue
+        if old.key in pinned_keys:
+            continue
+        if authoritative or old.key in absent:
+            continue
+        by_key[old.key] = old
+    for old in pinned:
+        current = by_key.get(old.key)
+        if current is None:
+            by_key[old.key] = old
+        else:
+            _copy_saved_fields(current, old)
+    return sorted(by_key.values(), key=lambda r: (r.record_type.value, r.index))
+
+
+def parse_id_list(text: str) -> list[tuple[int, str | None]]:
+    """Parse '0, 12-20, 19=Garage light' into (index, optional name) pairs.
+
+    Ranges are inclusive. A later entry for the same index replaces an earlier one.
+    """
+    found: dict[int, str | None] = {}
+    for part in text.replace(";", ",").split(","):
+        token = part.strip()
+        if not token:
+            continue
+        name: str | None = None
+        body = token
+        if "=" in token:
+            body, _, raw_name = token.partition("=")
+            name = raw_name.strip() or None
+            body = body.strip()
+        span = body.replace("–", "-").replace("—", "-")
+        try:
+            if "-" in span:
+                start_s, end_s = span.split("-", 1)
+                start, end = int(start_s.strip()), int(end_s.strip())
+                if start < 0 or end < start or end - start > 512:
+                    raise ValueError
+                for index in range(start, end + 1):
+                    found[index] = name
+            else:
+                index = int(span)
+                if index < 0:
+                    raise ValueError
+                found[index] = name
+        except ValueError:
+            raise ValueError(token) from None
+    return list(found.items())
+
+
+def format_id_list(records: list[Record]) -> str:
+    parts = []
+    for record in sorted(records, key=lambda r: r.index):
+        parts.append(f"{record.index}={record.name}" if record.name else str(record.index))
+    return ", ".join(parts)
+
+
+def manual_records_from_options(options: dict[str, Any]) -> list[Record]:
+    return records_from_data(list(options.get(CONF_MANUAL_RECORDS) or []))
+
+
+def pins_for(entry: ConfigEntry) -> list[Record]:
+    """Hand-entered records, plus anything migrated from 1.x. A scan cannot drop these."""
+    pinned = manual_records_from_options(entry.options)
+    legacy = set(entry.data.get(CONF_LEGACY_KEYS) or [])
+    have = {r.key for r in pinned}
+    for record in records_from_data(entry.data.get(CONF_RECORDS, [])):
+        if legacy_key(record) in legacy and record.key not in have:
+            pinned.append(record)
+    return pinned
+
+
 async def async_discover_records(
     hass: HomeAssistant, entry: ConfigEntry, client: ProtegeClient
 ) -> list[Record]:
@@ -103,24 +288,30 @@ async def async_discover_records(
 
     When an operator login is configured, the web interface is read first (one login):
     its record IDs tell discovery which records to read, and give names and zone settings.
-    Names saved from the last successful read are used when it can't be reached.
+    If that read fails (Protege GX has no WX web interface), names stay generic.
+
+    Saved IDs are probed even past the gap, but they are not treated as the complete list.
+    Passing them as `listed` made a gapped panel look finished and the next start never
+    looked for the records the previous scan had missed. Hand-entered and 1.x records are
+    pinned: a scan cannot delete them.
     """
     site = await _async_read_site(hass, entry)
-    saved = {r.key: r for r in records_from_data(entry.data.get(CONF_RECORDS, []))}
-    listed: dict[RecordType, list[int]] = {}
+    saved = records_from_data(entry.data.get(CONF_RECORDS, []))
+    pinned = pins_for(entry)
+    extra = [(r.record_type, r.index) for r in [*saved, *pinned]]
+    try:
+        gap = int(entry.options.get(CONF_DISCOVERY_GAP, DEFAULT_DISCOVERY_GAP))
+    except (TypeError, ValueError):
+        gap = DEFAULT_DISCOVERY_GAP
+    listed: dict[RecordType, list[int]] | None = None
     if site is not None:
+        listed = {}
         for record_type, items in site.lists.items():
             listed[record_type] = [rec_id for rec_id, _ in items if rec_id not in NO_RECORD]
-    else:
-        # Without the web interface, the records found last time still tell how the panel numbers them.
-        for record_type, index in saved:
-            listed.setdefault(record_type, []).append(index)
-    records = await client.discover(listed=listed or None)
-    for record in records:
-        if (old := saved.get(record.key)) is not None:
-            record.name = record.name or old.name
-            record.areas = old.areas if record.areas is None else record.areas
-            record.arm_open = old.arm_open if record.arm_open is None else record.arm_open
+    records = await client.discover(listed=listed or None, extra=extra, gap_tolerance=gap)
+    if entry.data.get(CONF_NUMBERING):
+        # Keep the numbering this entry was created with, so unique IDs do not change.
+        client.numbering = entry.data[CONF_NUMBERING]
     if site is not None:
         by_id = client.numbering == NUMBERING_RECORD_ID
         named = apply_names(records, site.lists, by_id=by_id)
@@ -131,7 +322,9 @@ async def async_discover_records(
             named,
             zoned,
         )
-    return records
+    return merge_records(
+        records, saved, pinned, set(client.last_absent), authoritative=site is not None
+    )
 
 
 async def _async_read_site(hass: HomeAssistant, entry: ConfigEntry) -> WXSite | None:
@@ -148,8 +341,8 @@ async def _async_read_site(hass: HomeAssistant, entry: ConfigEntry) -> WXSite | 
     )
     try:
         return await client.fetch_site()
-    except WXError as err:
-        _LOGGER.warning("Could not read names from the WX web interface: %s", err)
+    except Exception as err:  # noqa: BLE001 — GX has no WX API; any failure falls back to generic names
+        _LOGGER.warning("Could not read names from the web interface (%s); using generic names", err)
         return None
 
 
@@ -178,6 +371,11 @@ class ProtegeHub:
         self._area_alarm: dict[int, bool] = {}
         # The input that set each area's alarm off, kept until the area is disarmed.
         self.alarm_cause: dict[int, str | None] = {}
+        self._door_plans: dict[int, DoorUnlockPlan] = {}
+        self._door_timers: dict[int, CALLBACK_TYPE] = {}
+        self._reported_doors: dict[int, DoorStatus] = {}
+        self._reported_unlocked: set[int] = set()
+        self._tick_unsub: CALLBACK_TYPE | None = None
 
     # ----- identity -------------------------------------------------------
 
@@ -208,8 +406,13 @@ class ProtegeHub:
         # Anything reached through the WX web interface is a WX.
         has_web = self.web or bool(self.entry.options.get(CONF_WX_USERNAME))
         fw_type = "WX" if has_web else (self.panel.firmware_type or "WX")
+        identifiers = {(DOMAIN, self.serial)}
+        # 1.x addressed the controller as ict_controller. Keep that identifier so the
+        # existing device (and the areas children point at) is reused.
+        if self.legacy_keys:
+            identifiers.add((DOMAIN, "ict_controller"))
         return DeviceInfo(
-            identifiers={(DOMAIN, self.serial)},
+            identifiers=identifiers,
             name=f"Protege {fw_type}",
             manufacturer=MANUFACTURER,
             model=f"Protege {fw_type} controller",
@@ -245,13 +448,28 @@ class ProtegeHub:
         ACPUseDisplayOrder) rather than 1, 2, 3 in display order."""
         return self.web or self.entry.data.get(CONF_NUMBERING) == NUMBERING_RECORD_ID
 
+    @property
+    def legacy_keys(self) -> set[str]:
+        return set(self.entry.data.get(CONF_LEGACY_KEYS) or [])
+
+    def is_legacy(self, record: Record) -> bool:
+        return legacy_key(record) in self.legacy_keys
+
+    def entity_unique_id(self, record: Record, key: str) -> str:
+        """1.x entities keep ict_door_0 / ict_area_1 so Home Assistant does not create new ones."""
+        if self.is_legacy(record):
+            return legacy_unique_id(record, key)
+        return f"{self.record_device_id(record)}_{key}"
+
     def record_device_id(self, record: Record) -> str:
         """Also the prefix of the record's entity unique IDs.
 
         Record IDs get an "id" marker, so a record numbered one way can never take over
         the entity of a different record numbered the other way (door 1 by display order is
-        not door ID 1).
+        not door ID 1). Records migrated from 1.x keep that version's device id (door_0).
         """
+        if self.is_legacy(record):
+            return legacy_device_id(record)
         return record_id_prefix(self.serial, record.record_type, record.index, self.by_record_id)
 
     @property
@@ -330,12 +548,215 @@ class ProtegeHub:
                 self.alarm_cause[update.index] = None
         return []
 
+    # ----- timed unlock ---------------------------------------------------
+
+    def unlock_remaining(self, index: int) -> tuple[str, int] | None:
+        """ISO unlock_until and whole seconds left, once the controller reports unlocked."""
+        plan = self._door_plans.get(index)
+        if plan is None or plan.until is None or index not in self._reported_unlocked:
+            return None
+        return dt_util.utc_from_timestamp(plan.until).isoformat(), max(0, int(plan.until - time.time()))
+
+    async def async_schedule_relock(
+        self, index: int, seconds: int, source: str = SOURCE_HOME_ASSISTANT
+    ) -> None:
+        """Unlock stays latched until `seconds` have passed, then this integration locks it."""
+        self._door_plans[index] = DoorUnlockPlan(source=source, duration=seconds, until=time.time() + seconds)
+        self._arm_timer(index)
+        self._ensure_tick()
+        await self._save_door_plans()
+
+    async def async_cancel_relock(self, index: int) -> DoorUnlockPlan | None:
+        """A manual lock. The timer must not lock the door again afterwards.
+
+        Returns the suspended plan so the caller can put it back if the lock command fails.
+        """
+        plan = self._door_plans.get(index)
+        if plan is None or plan.until is None:
+            return None
+        suspended = DoorUnlockPlan(source=plan.source, duration=plan.duration, until=plan.until)
+        plan.until = None
+        plan.relock_requested = True
+        self._cancel_timer(index)
+        self._ensure_tick()
+        await self._save_door_plans()
+        return suspended
+
+    async def async_resume_relock(self, index: int, suspended: DoorUnlockPlan) -> None:
+        """Put back a timer suspended for a lock command that the panel refused."""
+        if suspended.until is None:
+            return
+        plan = self._door_plans.get(index)
+        if plan is None:
+            plan = DoorUnlockPlan(source=suspended.source)
+            self._door_plans[index] = plan
+        plan.source = suspended.source
+        plan.duration = suspended.duration
+        plan.until = suspended.until
+        plan.relock_requested = False
+        self._arm_timer(index)
+        self._ensure_tick()
+        await self._save_door_plans()
+
+    async def async_forget_relock(self, index: int) -> None:
+        """Drop a timer whose unlock command never succeeded."""
+        if self._door_plans.pop(index, None) is None:
+            return
+        self._cancel_timer(index)
+        self._ensure_tick()
+        await self._save_door_plans()
+
+    def _arm_timer(self, index: int, delay: float | None = None) -> None:
+        plan = self._door_plans.get(index)
+        if plan is None or plan.until is None:
+            return
+        if delay is None:
+            delay = max(0.0, plan.until - time.time())
+        self._cancel_timer(index)
+
+        @callback
+        def fire(_now: Any) -> None:
+            self._door_timers.pop(index, None)
+            self.hass.async_create_task(self._relock(index))
+
+        self._door_timers[index] = async_call_later(self.hass, delay, fire)
+
+    def _cancel_timer(self, index: int) -> None:
+        if (unsub := self._door_timers.pop(index, None)) is not None:
+            unsub()
+
+    def _cancel_door_timers(self) -> None:
+        for index in list(self._door_timers):
+            self._cancel_timer(index)
+        if self._tick_unsub is not None:
+            self._tick_unsub()
+            self._tick_unsub = None
+
+    def _ensure_tick(self) -> None:
+        """Refresh remaining time while a timed unlock is showing."""
+        active = any(plan.until is not None for plan in self._door_plans.values())
+        if active and self._tick_unsub is None:
+            self._tick_unsub = async_track_time_interval(self.hass, self._tick_doors, timedelta(seconds=1))
+        elif not active and self._tick_unsub is not None:
+            self._tick_unsub()
+            self._tick_unsub = None
+
+    @callback
+    def _tick_doors(self, _now: Any) -> None:
+        for index, plan in self._door_plans.items():
+            if plan.until is None:
+                continue
+            for listener in list(self._listeners.get((RecordType.DOOR, index), ())):
+                listener()
+        self._ensure_tick()
+
+    async def _relock(self, index: int) -> None:
+        plan = self._door_plans.get(index)
+        if plan is None or plan.until is None:
+            return
+        plan.relock_requested = True
+        try:
+            await self.client.door_lock(index)
+        except CommandRejected as err:
+            plan.relock_requested = False
+            if err.code == proto.NACK_SERVICE_INDEX_NOT_VALID:
+                await self.async_forget_relock(index)
+                return
+            _LOGGER.warning("Could not relock door %s: %s", index, err)
+            self._arm_timer(index, RELOCK_RETRY)
+        except ProtegeError as err:
+            plan.relock_requested = False
+            _LOGGER.warning("Could not relock door %s: %s", index, err)
+            self._arm_timer(index, RELOCK_RETRY)
+
+    async def _restore_unlocks(self) -> None:
+        data = await door_unlock_store(self.hass, self.entry).async_load() or {}
+        known = {r.index for r in self.records_of(RecordType.DOOR)}
+        for key, item in (data.get("doors") or {}).items():
+            try:
+                index = int(key)
+                until = float(item["until"])
+                duration = int(item["duration"])
+                source = str(item.get("source") or SOURCE_HOME_ASSISTANT)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if index not in known:
+                continue
+            self._door_plans[index] = DoorUnlockPlan(source=source, duration=duration, until=until)
+            self._arm_timer(index)
+        self._ensure_tick()
+
+    async def _save_door_plans(self) -> None:
+        doors = {
+            str(index): {"until": plan.until, "duration": plan.duration, "source": plan.source}
+            for index, plan in self._door_plans.items()
+            if plan.until is not None
+        }
+        await door_unlock_store(self.hass, self.entry).async_save({"doors": doors})
+
+    def _door_source(self, index: int, status: DoorStatus, *, relock: bool) -> str:
+        plan = self._door_plans.get(index)
+        if relock:
+            if plan is not None and plan.relock_requested:
+                return plan.source
+            return "controller"
+        if plan is not None and plan.until is not None:
+            return plan.source
+        if status.door_state == DoorState.FORCED_OPEN:
+            return "forced"
+        state = status.lock_state
+        if isinstance(state, DoorLockState):
+            return _LOCK_SOURCES.get(state, state.name.lower())
+        return "controller"
+
+    def _fire_door(self, index: int, action: str, status: DoorStatus) -> None:
+        record = next((r for r in self.records_of(RecordType.DOOR) if r.index == index), None)
+        plan = self._door_plans.get(index)
+        self.hass.bus.async_fire(
+            EVENT_DOOR,
+            {
+                "entry_id": self.entry.entry_id,
+                "action": action,
+                "door": record.default_name if record else f"Door {index}",
+                "source": self._door_source(index, status, relock=action == "relocked"),
+                "duration": None if plan is None else plan.duration,
+            },
+        )
+
+    def _on_reported_door(self, index: int, status: DoorStatus) -> None:
+        """Fire door events from the controller's status, not from an assumed command."""
+        previous = self._reported_doors.get(index)
+        self._reported_doors[index] = status
+        if status.locked:
+            self._reported_unlocked.discard(index)
+        else:
+            self._reported_unlocked.add(index)
+        if previous is None:
+            return
+        relocked = not previous.locked and status.locked
+        if previous.locked and not status.locked:
+            self._fire_door(index, "unlocked", status)
+        elif relocked:
+            self._fire_door(index, "relocked", status)
+        was_open = previous.door_state != DoorState.CLOSED
+        now_open = status.door_state != DoorState.CLOSED
+        if not was_open and now_open:
+            self._fire_door(index, "opened", status)
+        elif was_open and not now_open:
+            self._fire_door(index, "closed", status)
+        if relocked and index in self._door_plans:
+            self._door_plans.pop(index, None)
+            self._cancel_timer(index)
+            self._ensure_tick()
+            self.hass.async_create_task(self._save_door_plans())
+
     # ----- lifecycle ------------------------------------------------------
 
     async def async_start(self) -> None:
         self._unsubs.append(self.client.add_status_listener(self._on_status))
         self._unsubs.append(self.client.add_connection_listener(self._on_connection))
         await self.client.start(self.records)
+        await self._restore_unlocks()
 
         if self.web:
             # The web client reads the event log itself.
@@ -351,6 +772,7 @@ class ProtegeHub:
             await self.events.start()
 
     async def async_stop(self) -> None:
+        self._cancel_door_timers()
         for unsub in self._unsubs:
             unsub()
         self._unsubs.clear()
@@ -394,6 +816,12 @@ class ProtegeHub:
 
     @callback
     def _on_status(self, update: StatusUpdate) -> None:
+        if (
+            update.record_type is RecordType.DOOR
+            and isinstance(update.status, DoorStatus)
+            and update.reported
+        ):
+            self._on_reported_door(update.index, update.status)
         dependants = self._track(update)
         for key in [(update.record_type, update.index), *dependants]:
             for listener in list(self._listeners.get(key, ())):
@@ -480,7 +908,14 @@ def link_child_devices(hass: HomeAssistant, hub: ProtegeHub) -> None:
     dev_reg = dr.async_get(hass)
     devices = dr.async_entries_for_config_entry(dev_reg, hub.entry.entry_id)
     # Look the controller up within this entry: async_get_device is deprecated.
-    controller = next((d for d in devices if (DOMAIN, hub.serial) in d.identifiers), None)
+    controller = next(
+        (
+            d
+            for d in devices
+            if (DOMAIN, hub.serial) in d.identifiers or (DOMAIN, "ict_controller") in d.identifiers
+        ),
+        None,
+    )
     if controller is None:
         return
     by_identifier = {ident: d for d in devices for ident in d.identifiers}
@@ -502,6 +937,8 @@ def remove_stale_devices(hass: HomeAssistant, hub: ProtegeHub) -> None:
     """Drop devices for records that no longer exist on the panel."""
     dev_reg = dr.async_get(hass)
     valid = {(DOMAIN, hub.serial)}
+    if hub.legacy_keys:
+        valid.add((DOMAIN, "ict_controller"))
     for record in hub.records:
         if record.record_type is not RecordType.TROUBLE_INPUT:
             valid.add((DOMAIN, hub.record_device_id(record)))
